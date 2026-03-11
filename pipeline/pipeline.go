@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"strconv"
 	"strings"
@@ -73,6 +74,9 @@ func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64) ([]byte, string, 
 	if err != nil {
 		return nil, elNode, fmt.Errorf("pipeline: decoding headers: %w", err)
 	}
+
+	log.Printf("block #%d [%s]: witness state=%d codes=%d keys=%d headers=%d (raw=%s)",
+		blockNum, elNode, len(w.State), len(w.Codes), len(w.Keys), len(headers), w.Headers)
 
 	encoded, err := encode(blockRLP, w, headers)
 	return encoded, elNode, err
