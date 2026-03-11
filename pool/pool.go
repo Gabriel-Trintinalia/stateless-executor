@@ -21,9 +21,11 @@ import (
 )
 
 const (
-	pollInterval = 500 * time.Millisecond
-	probeTimeout = 10 * time.Second
-	rpcTimeout   = 5 * time.Second
+	pollInterval  = 500 * time.Millisecond
+	probeTimeout  = 10 * time.Second
+	rpcTimeout    = 5 * time.Second
+	probeRetryMax = 60               // max probe attempts before giving up
+	probeRetryWait = 5 * time.Second // wait between retries
 )
 
 type rpcRequest struct {
@@ -54,38 +56,48 @@ type Pool struct {
 }
 
 // New probes each URL and returns a Pool containing only responsive nodes.
+// It retries until at least one node supports debug_executionWitness or the
+// retry limit is reached (allows EL nodes time to start up).
 func New(urls []string) (*Pool, error) {
 	p := &Pool{
 		Heads:  make(chan uint64, 32),
 		client: &http.Client{Timeout: rpcTimeout},
 	}
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var healthy []string
+	for attempt := 1; attempt <= probeRetryMax; attempt++ {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var healthy []string
 
-	for _, u := range urls {
-		wg.Add(1)
-		go func(url string) {
-			defer wg.Done()
-			if probe(url) {
-				mu.Lock()
-				healthy = append(healthy, url)
-				mu.Unlock()
-				log.Printf("pool: %s OK", url)
-			} else {
-				log.Printf("pool: %s SKIP (debug_executionWitness not supported)", url)
-			}
-		}(u)
-	}
-	wg.Wait()
+		for _, u := range urls {
+			wg.Add(1)
+			go func(url string) {
+				defer wg.Done()
+				if probe(url) {
+					mu.Lock()
+					healthy = append(healthy, url)
+					mu.Unlock()
+					log.Printf("pool: %s OK", url)
+				} else {
+					log.Printf("pool: %s not ready (debug_executionWitness unsupported or node down)", url)
+				}
+			}(u)
+		}
+		wg.Wait()
 
-	if len(healthy) == 0 {
-		return nil, fmt.Errorf("no EL nodes support debug_executionWitness")
+		if len(healthy) > 0 {
+			p.nodes = healthy
+			metrics.ELPoolSize.Set(float64(len(healthy)))
+			return p, nil
+		}
+
+		if attempt < probeRetryMax {
+			log.Printf("pool: no healthy nodes (attempt %d/%d), retrying in %s…", attempt, probeRetryMax, probeRetryWait)
+			time.Sleep(probeRetryWait)
+		}
 	}
-	p.nodes = healthy
-	metrics.ELPoolSize.Set(float64(len(healthy)))
-	return p, nil
+
+	return nil, fmt.Errorf("no EL nodes support debug_executionWitness after %d attempts", probeRetryMax)
 }
 
 // Run starts the polling loop; call in a goroutine.
