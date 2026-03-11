@@ -14,9 +14,10 @@ type Result struct {
 	Guest         string `json:"guest"`
 	WitnessFrom   string `json:"witness_from"`
 	Valid         bool   `json:"valid"`
-	PreStateRoot  string `json:"pre_state_root"`
-	PostStateRoot string `json:"post_state_root"`
-	ReceiptsRoot  string `json:"receipts_root"`
+	Error         string `json:"error,omitempty"`
+	PreStateRoot  string `json:"pre_state_root,omitempty"`
+	PostStateRoot string `json:"post_state_root,omitempty"`
+	ReceiptsRoot  string `json:"receipts_root,omitempty"`
 	DurationMs    int64  `json:"duration_ms"`
 	Timestamp     int64  `json:"timestamp"`
 }

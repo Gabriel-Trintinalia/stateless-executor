@@ -98,11 +98,13 @@ func main() {
 					defer runCancel()
 
 					result, err := runner.Run(runCtx, spec, input, forkName)
-					if err != nil {
-						log.Printf("block #%d [%s]: runner error: %v", blockNum, spec.Name, err)
-						return
-					}
 					result.WitnessFrom = elNode
+					if err != nil {
+						result.Block = blockNum
+						result.Guest = spec.Name
+						result.Error = err.Error()
+						log.Printf("block #%d [%s]: runner error: %v", blockNum, spec.Name, err)
+					}
 					buf.Add(result)
 					if result.Valid {
 						log.Printf("block #%d [%s]: OK (%dms)", blockNum, spec.Name, result.DurationMs)
