@@ -102,7 +102,7 @@ func main() {
 						log.Printf("block #%d [%s]: runner error: %v", blockNum, spec.Name, err)
 						return
 					}
-					result.ElNode = elNode
+					result.WitnessFrom = elNode
 					buf.Add(result)
 					if result.Valid {
 						log.Printf("block #%d [%s]: OK (%dms)", blockNum, spec.Name, result.DurationMs)

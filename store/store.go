@@ -12,7 +12,7 @@ import (
 type Result struct {
 	Block         uint64 `json:"block"`
 	Guest         string `json:"guest"`
-	ElNode        string `json:"el_node"`
+	WitnessFrom   string `json:"witness_from"`
 	Valid         bool   `json:"valid"`
 	PreStateRoot  string `json:"pre_state_root"`
 	PostStateRoot string `json:"post_state_root"`
