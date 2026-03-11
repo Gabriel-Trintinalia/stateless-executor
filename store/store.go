@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
-	"time"
 )
 
 // Result is one block verification result stored in the ring buffer
@@ -19,7 +18,6 @@ type Result struct {
 	PostStateRoot string `json:"post_state_root,omitempty"`
 	ReceiptsRoot  string `json:"receipts_root,omitempty"`
 	DurationMs    int64  `json:"duration_ms"`
-	Timestamp     int64  `json:"timestamp"`
 }
 
 const capacity = 1000
@@ -32,9 +30,8 @@ type RingBuffer struct {
 	count int
 }
 
-// Add inserts a result, stamping the current Unix timestamp.
+// Add inserts a result into the ring buffer.
 func (r *RingBuffer) Add(res Result) {
-	res.Timestamp = time.Now().Unix()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.items[r.head] = res
