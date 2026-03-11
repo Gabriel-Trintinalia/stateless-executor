@@ -86,7 +86,10 @@ go run .
 
 ## Kurtosis integration
 
-The `kurtosis/launcher.star` module integrates with [ethereum-package](https://github.com/Gabriel-Trintinalia/ethereum-package).
+The launcher and Grafana dashboard live in the [ethereum-package](https://github.com/Gabriel-Trintinalia/ethereum-package) fork alongside other services:
+
+- `src/stateless_executor/stateless_executor_launcher.star`
+- `static_files/grafana-config/dashboards/stateless-executor.json`
 
 The launcher pulls each guest image, extracts the binary via `plan.run_sh`, mounts it as a Kurtosis file artifact into the executor container, and passes the binary paths via `GUEST_BINARIES`. No Docker daemon is needed inside the container.
 
@@ -121,22 +124,11 @@ kurtosis run --enclave my-testnet \
 
 ```
 stateless-executor/
-├── main.go           # entry point, wiring
-├── pool/             # EL RPC pool — probes debug_executionWitness, polls heads
-├── pipeline/         # fetches block RLP + witness, encodes binary input
-├── runner/           # executes guest binaries, parses JSON output
-├── store/            # ring buffer + /results HTTP handler
-├── metrics/          # Prometheus metrics
-├── kurtosis/
-│   ├── launcher.star # Kurtosis launcher module
-│   └── grafana/
-│       └── dashboard.json  # Grafana dashboard (verification rate + results table)
+├── main.go       # entry point, wiring
+├── pool/         # EL RPC pool — probes debug_executionWitness, polls heads
+├── pipeline/     # fetches block RLP + witness, encodes binary input
+├── runner/       # executes guest binaries, parses JSON output
+├── store/        # ring buffer + /results HTTP handler
+├── metrics/      # Prometheus metrics
 └── Dockerfile
 ```
-
-## Grafana dashboard
-
-`kurtosis/grafana/dashboard.json` provides two panels:
-
-- **Verification rate** — `rate(stateless_block_verified_total{result="ok"}[1m])` per guest
-- **Recent results table** — live feed from `/results` (requires the [Infinity datasource plugin](https://grafana.com/grafana/plugins/yesoreyeram-infinity-datasource/))
