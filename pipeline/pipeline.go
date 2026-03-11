@@ -65,11 +65,15 @@ func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64) ([]byte, string, 
 		return nil, elNode, fmt.Errorf("pipeline: decoding witness JSON: %w", err)
 	}
 
-	// Decode headers: some clients (besu) return []hex-string; others (geth, reth)
-	// return an array of full header objects. Extract hex strings where possible.
-	headers, err := decodeHeaders(w.Headers)
+	// Decode headers: some clients return []hex-string; others (e.g. geth) return
+	// an array of full header objects. If format is wrong, remove from pool.
+	headers, formatOK, err := decodeHeaders(w.Headers)
 	if err != nil {
 		return nil, elNode, fmt.Errorf("pipeline: decoding headers: %w", err)
+	}
+	if !formatOK {
+		log.Printf("pipeline: %s returned unsupported witness format; removing from pool", elNode)
+		p.Remove(rawURL)
 	}
 
 	encoded, err := encode(blockRLP, w, headers)
@@ -105,25 +109,22 @@ func encode(blockRLP []byte, w witness, headers [][]byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// decodeHeaders handles the two formats debug_executionWitness clients return:
-//   - []string — hex-encoded RLP (besu)
-//   - []object — full header JSON objects (geth, reth); not yet RLP-encodable
-//     here, so we skip them and pass an empty array.
-func decodeHeaders(raw json.RawMessage) ([][]byte, error) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return nil, nil
+// decodeHeaders parses the headers field from debug_executionWitness.
+// Returns the decoded bytes, a boolean indicating whether the format was
+// recognised (false = unsupported, caller should remove that node), and any
+// decode error.
+func decodeHeaders(raw json.RawMessage) ([][]byte, bool, error) {
+	if len(raw) == 0 || string(raw) == "null" || string(raw) == "[]" {
+		return nil, true, nil
 	}
-	// Try []string first.
+	// Expected format: []hex-string (besu, reth).
 	var hexStrs []string
 	if err := json.Unmarshal(raw, &hexStrs); err == nil {
-		return decodeHexArray(hexStrs)
+		decoded, err := decodeHexArray(hexStrs)
+		return decoded, true, err
 	}
-	// Array of objects (geth/reth): we cannot RLP-encode arbitrary header JSON
-	// without a full Ethereum type library, so pass empty for now.
-	// BLOCKHASH opcode returns 0 for unknown ancestors — acceptable for blocks
-	// that don't use BLOCKHASH.
-	log.Printf("pipeline: headers field is not []hex-string (likely full header objects); passing empty headers array")
-	return nil, nil
+	// Unsupported format (e.g. geth returns full header objects).
+	return nil, false, nil
 }
 
 // writeArray writes [u64 count] followed by [u64 len][bytes] for each element.

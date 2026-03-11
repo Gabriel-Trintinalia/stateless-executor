@@ -17,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Gabriel-Trintinalia/stateless-executor/metrics"
 )
 
 const (
@@ -87,7 +86,6 @@ func New(urls []string) (*Pool, error) {
 
 		if len(healthy) > 0 {
 			p.nodes = healthy
-			metrics.ELPoolSize.Set(float64(len(healthy)))
 			return p, nil
 		}
 
@@ -148,6 +146,20 @@ func (p *Pool) next() string {
 // Pick returns any healthy URL (used by pipeline to fetch block data).
 func (p *Pool) Pick() string {
 	return p.next()
+}
+
+// Remove permanently drops a URL from the pool (e.g. unsupported witness format).
+func (p *Pool) Remove(url string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	updated := p.nodes[:0]
+	for _, u := range p.nodes {
+		if u != url {
+			updated = append(updated, u)
+		}
+	}
+	p.nodes = updated
+	log.Printf("pool: removed %s (%d node(s) remaining)", url, len(p.nodes))
 }
 
 // probe calls debug_executionWitness on "latest" and returns true if supported.
