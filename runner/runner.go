@@ -97,14 +97,14 @@ func Run(ctx context.Context, spec GuestSpec, input []byte, forkName string) (st
 	if err != nil {
 		metrics.BlockVerifiedTotal.WithLabelValues(spec.Name, "error").Inc()
 		metrics.VerificationDurationMs.WithLabelValues(spec.Name).Observe(float64(durationMs))
-		return store.Result{Log: logOutput}, fmt.Errorf("runner [%s]: %w", spec.Name, err)
+		return store.Result{Log: logOutput, HasLog: logOutput != ""}, fmt.Errorf("runner [%s]: %w", spec.Name, err)
 	}
 
 	line, parseErr := lastJSONLine(stdout.Bytes())
 	if parseErr != nil {
 		metrics.BlockVerifiedTotal.WithLabelValues(spec.Name, "error").Inc()
 		metrics.VerificationDurationMs.WithLabelValues(spec.Name).Observe(float64(durationMs))
-		return store.Result{Log: logOutput}, fmt.Errorf("runner [%s]: parsing output: %w (stdout=%q)", spec.Name, parseErr, stdout.String())
+		return store.Result{Log: logOutput, HasLog: logOutput != ""}, fmt.Errorf("runner [%s]: parsing output: %w (stdout=%q)", spec.Name, parseErr, stdout.String())
 	}
 
 	result := "ok"
@@ -119,6 +119,7 @@ func Run(ctx context.Context, spec GuestSpec, input []byte, forkName string) (st
 		Guest:         spec.Name,
 		Valid:         line.Valid,
 		Log:           logOutput,
+		HasLog:        logOutput != "",
 		PreStateRoot:  line.PreStateRoot,
 		PostStateRoot: line.PostStateRoot,
 		ReceiptsRoot:  line.ReceiptsRoot,

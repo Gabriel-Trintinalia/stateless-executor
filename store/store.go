@@ -2,7 +2,10 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -14,7 +17,8 @@ type Result struct {
 	WitnessFrom   string `json:"witness_from"`
 	Valid         bool   `json:"valid"`
 	Error         string `json:"error,omitempty"`
-	Log           string `json:"log,omitempty"`
+	Log           string `json:"-"`
+	HasLog        bool   `json:"has_log,omitempty"`
 	PreStateRoot  string `json:"pre_state_root,omitempty"`
 	PostStateRoot string `json:"post_state_root,omitempty"`
 	ReceiptsRoot  string `json:"receipts_root,omitempty"`
@@ -59,5 +63,34 @@ func (r *RingBuffer) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(r.All())
+	}
+}
+
+// OutputHandler returns an http.HandlerFunc for GET /output/{block}.
+// It finds all results for that block and returns their logs as plain text.
+func (r *RingBuffer) OutputHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		blockStr := strings.TrimPrefix(req.URL.Path, "/output/")
+		blockNum, err := strconv.ParseUint(blockStr, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid block number", http.StatusBadRequest)
+			return
+		}
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		var found bool
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		for i := range r.count {
+			idx := (r.head - r.count + i + capacity) % capacity
+			res := r.items[idx]
+			if res.Block != blockNum {
+				continue
+			}
+			found = true
+			fmt.Fprintf(w, "=== block #%d [%s] ===\n\n%s\n\n", res.Block, res.Guest, res.Log)
+		}
+		if !found {
+			http.Error(w, fmt.Sprintf("no output for block %d", blockNum), http.StatusNotFound)
+		}
 	}
 }
