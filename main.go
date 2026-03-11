@@ -81,13 +81,13 @@ func main() {
 			metrics.BlockHeight.Set(float64(blockNum))
 
 			fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
-			input, err := pipeline.Fetch(fetchCtx, p, blockNum)
+			input, elNode, err := pipeline.Fetch(fetchCtx, p, blockNum)
 			fetchCancel()
 			if err != nil {
 				log.Printf("block #%d: fetch error: %v", blockNum, err)
 				continue
 			}
-			log.Printf("block #%d: encoded %d bytes, fanning out to %d guest(s)", blockNum, len(input), len(guests))
+			log.Printf("block #%d: encoded %d bytes from %s, fanning out to %d guest(s)", blockNum, len(input), elNode, len(guests))
 
 			var wg sync.WaitGroup
 			for _, g := range guests {
@@ -102,6 +102,7 @@ func main() {
 						log.Printf("block #%d [%s]: runner error: %v", blockNum, spec.Name, err)
 						return
 					}
+					result.ElNode = elNode
 					buf.Add(result)
 					if result.Valid {
 						log.Printf("block #%d [%s]: OK (%dms)", blockNum, spec.Name, result.DurationMs)

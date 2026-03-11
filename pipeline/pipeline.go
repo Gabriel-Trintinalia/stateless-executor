@@ -17,6 +17,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -25,47 +27,57 @@ import (
 
 // witness mirrors the JSON returned by debug_executionWitness.
 type witness struct {
-	State   []string `json:"state"`
-	Codes   []string `json:"codes"`
-	Keys    []string `json:"keys"`
-	Headers []string `json:"headers"`
+	State   []string        `json:"state"`
+	Codes   []string        `json:"codes"`
+	Keys    []string        `json:"keys"`
+	Headers json.RawMessage `json:"headers"` // []string (hex) or []object depending on client
 }
 
 // Fetch retrieves the block RLP and witness for blockNum, then encodes them
-// into the binary guest input format. Returns the encoded bytes.
-func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64) ([]byte, error) {
-	url := p.Pick()
-	if url == "" {
-		return nil, fmt.Errorf("pipeline: no healthy EL node available")
+// into the binary guest input format. Returns the encoded bytes and the EL
+// node hostname that served the witness.
+func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64) ([]byte, string, error) {
+	rawURL := p.Pick()
+	if rawURL == "" {
+		return nil, "", fmt.Errorf("pipeline: no healthy EL node available")
 	}
+	elNode := hostname(rawURL)
 
 	hexNum := "0x" + strconv.FormatUint(blockNum, 16)
 
 	// Fetch raw block RLP.
-	rawBlockResult, err := p.CallRaw(ctx, url, "debug_getRawBlock", []interface{}{hexNum})
+	rawBlockResult, err := p.CallRaw(ctx, rawURL, "debug_getRawBlock", []interface{}{hexNum})
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: debug_getRawBlock(%d): %w", blockNum, err)
+		return nil, elNode, fmt.Errorf("pipeline: debug_getRawBlock(%d): %w", blockNum, err)
 	}
 	blockRLP, err := decodeHexResult(rawBlockResult)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: decoding block RLP: %w", err)
+		return nil, elNode, fmt.Errorf("pipeline: decoding block RLP: %w", err)
 	}
 
 	// Fetch execution witness.
-	witnessResult, err := p.CallRaw(ctx, url, "debug_executionWitness", []interface{}{hexNum})
+	witnessResult, err := p.CallRaw(ctx, rawURL, "debug_executionWitness", []interface{}{hexNum})
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: debug_executionWitness(%d): %w", blockNum, err)
+		return nil, elNode, fmt.Errorf("pipeline: debug_executionWitness(%d): %w", blockNum, err)
 	}
 	var w witness
 	if err := json.Unmarshal(witnessResult, &w); err != nil {
-		return nil, fmt.Errorf("pipeline: decoding witness JSON: %w", err)
+		return nil, elNode, fmt.Errorf("pipeline: decoding witness JSON: %w", err)
 	}
 
-	return encode(blockRLP, w)
+	// Decode headers: some clients (besu) return []hex-string; others (geth, reth)
+	// return an array of full header objects. Extract hex strings where possible.
+	headers, err := decodeHeaders(w.Headers)
+	if err != nil {
+		return nil, elNode, fmt.Errorf("pipeline: decoding headers: %w", err)
+	}
+
+	encoded, err := encode(blockRLP, w, headers)
+	return encoded, elNode, err
 }
 
 // encode serialises blockRLP + witness into the binary guest format.
-func encode(blockRLP []byte, w witness) ([]byte, error) {
+func encode(blockRLP []byte, w witness, headers [][]byte) ([]byte, error) {
 	var buf bytes.Buffer
 
 	// [u64: block_rlp_len] [block_rlp_bytes]
@@ -74,8 +86,8 @@ func encode(blockRLP []byte, w witness) ([]byte, error) {
 	}
 	buf.Write(blockRLP)
 
-	// Four arrays in order: state, codes, keys, headers.
-	for _, arr := range [][]string{w.State, w.Codes, w.Keys, w.Headers} {
+	// Three hex-string arrays: state, codes, keys.
+	for _, arr := range [][]string{w.State, w.Codes, w.Keys} {
 		decoded, err := decodeHexArray(arr)
 		if err != nil {
 			return nil, err
@@ -85,7 +97,33 @@ func encode(blockRLP []byte, w witness) ([]byte, error) {
 		}
 	}
 
+	// Headers (already decoded).
+	if err := writeArray(&buf, headers); err != nil {
+		return nil, err
+	}
+
 	return buf.Bytes(), nil
+}
+
+// decodeHeaders handles the two formats debug_executionWitness clients return:
+//   - []string — hex-encoded RLP (besu)
+//   - []object — full header JSON objects (geth, reth); not yet RLP-encodable
+//     here, so we skip them and pass an empty array.
+func decodeHeaders(raw json.RawMessage) ([][]byte, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	// Try []string first.
+	var hexStrs []string
+	if err := json.Unmarshal(raw, &hexStrs); err == nil {
+		return decodeHexArray(hexStrs)
+	}
+	// Array of objects (geth/reth): we cannot RLP-encode arbitrary header JSON
+	// without a full Ethereum type library, so pass empty for now.
+	// BLOCKHASH opcode returns 0 for unknown ancestors — acceptable for blocks
+	// that don't use BLOCKHASH.
+	log.Printf("pipeline: headers field is not []hex-string (likely full header objects); passing empty headers array")
+	return nil, nil
 }
 
 // writeArray writes [u64 count] followed by [u64 len][bytes] for each element.
@@ -137,4 +175,13 @@ func hexToBytes(s string) ([]byte, error) {
 		s = "0" + s
 	}
 	return hex.DecodeString(s)
+}
+
+// hostname extracts the host portion from a URL (e.g. "http://el-2-geth:8545" → "el-2-geth").
+func hostname(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	return u.Hostname()
 }
