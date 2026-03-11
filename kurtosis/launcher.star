@@ -87,15 +87,19 @@ def launch(
 
     service = plan.add_service(SERVICE_NAME, config)
 
-    http_url = "http://{0}:{1}".format(service.ip_address, HTTP_PORT_NUM)
-    plan.print("stateless-executor: {0}".format(http_url))
+    # service.ports[HTTP_PORT_ID].url is the host-mapped URL shown in
+    # `kurtosis enclave inspect` (e.g. http://127.0.0.1:56497).
+    public_url = service.ports[HTTP_PORT_ID].url
+    plan.print("stateless-executor")
+    plan.print("  results: {0}/results".format(public_url))
+    plan.print("  metrics: {0}/metrics".format(public_url))
 
     return struct(
         service_name=SERVICE_NAME,
         ip_address=service.ip_address,
-        http_url=http_url,
-        metrics_url="{0}/metrics".format(http_url),
-        results_url="{0}/results".format(http_url),
+        http_url=public_url,
+        metrics_url="{0}/metrics".format(public_url),
+        results_url="{0}/results".format(public_url),
     )
 
 
