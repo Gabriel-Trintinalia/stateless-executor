@@ -1,4 +1,4 @@
-// Package runner executes a guest docker image against binary block input and
+// Package runner executes a guest binary against binary block input and
 // parses the JSON result line written to stdout.
 //
 // Guest contract:
@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -21,6 +22,36 @@ import (
 	"github.com/eth-proofs/stateless-executor/metrics"
 	"github.com/eth-proofs/stateless-executor/store"
 )
+
+// GuestSpec identifies a guest binary by name and filesystem path.
+type GuestSpec struct {
+	Name string
+	Path string
+}
+
+// ParseGuestSpecs parses the GUEST_BINARIES env var value.
+// Format: "name:/path/to/binary,name2:/path/to/binary2"
+func ParseGuestSpecs(s string) ([]GuestSpec, error) {
+	var specs []GuestSpec
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		idx := strings.Index(entry, ":")
+		if idx < 0 {
+			return nil, fmt.Errorf("invalid GUEST_BINARIES entry %q: expected name:/path", entry)
+		}
+		specs = append(specs, GuestSpec{
+			Name: entry[:idx],
+			Path: entry[idx+1:],
+		})
+	}
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("GUEST_BINARIES is empty")
+	}
+	return specs, nil
+}
 
 // guestResult is the JSON line emitted by the guest to stdout.
 type guestResult struct {
@@ -31,19 +62,24 @@ type guestResult struct {
 	ReceiptsRoot  string `json:"receipts_root"`
 }
 
-// Run executes the guest image, feeding input via stdin, and returns a
-// store.Result ready to be added to the ring buffer.
+// Run executes the guest binary at spec.Path, feeding input via stdin, and
+// returns a store.Result ready to be added to the ring buffer.
 //
 // forkName is optional (e.g. "cancun"); if non-empty it is passed as --fork.
-func Run(ctx context.Context, image string, input []byte, forkName string) (store.Result, error) {
+func Run(ctx context.Context, spec GuestSpec, input []byte, forkName string) (store.Result, error) {
+	// Ensure the binary is executable (Kurtosis file artifacts may drop the bit).
+	if err := os.Chmod(spec.Path, 0755); err != nil {
+		log.Printf("runner [%s]: chmod %s: %v (continuing)", spec.Name, spec.Path, err)
+	}
+
 	start := time.Now()
 
-	args := []string{"run", "--rm", "-i", image}
+	args := []string{}
 	if forkName != "" {
 		args = append(args, "--fork", forkName)
 	}
 
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := exec.CommandContext(ctx, spec.Path, args...)
 	cmd.Stdin = bytes.NewReader(input)
 
 	var stdout, stderr bytes.Buffer
@@ -53,37 +89,33 @@ func Run(ctx context.Context, image string, input []byte, forkName string) (stor
 	err := cmd.Run()
 	durationMs := time.Since(start).Milliseconds()
 
-	// Always log stderr so operator can see guest progress.
 	if s := strings.TrimSpace(stderr.String()); s != "" {
-		log.Printf("runner [%s]: %s", image, s)
+		log.Printf("runner [%s]: %s", spec.Name, s)
 	}
-
-	shortName := shortImage(image)
 
 	if err != nil {
-		metrics.BlockVerifiedTotal.WithLabelValues(shortName, "error").Inc()
-		metrics.VerificationDurationMs.WithLabelValues(shortName).Observe(float64(durationMs))
-		return store.Result{}, fmt.Errorf("docker run %s: %w", image, err)
+		metrics.BlockVerifiedTotal.WithLabelValues(spec.Name, "error").Inc()
+		metrics.VerificationDurationMs.WithLabelValues(spec.Name).Observe(float64(durationMs))
+		return store.Result{}, fmt.Errorf("runner [%s]: %w", spec.Name, err)
 	}
 
-	// Parse the last non-empty line of stdout as the JSON result.
 	line, parseErr := lastJSONLine(stdout.Bytes())
 	if parseErr != nil {
-		metrics.BlockVerifiedTotal.WithLabelValues(shortName, "error").Inc()
-		metrics.VerificationDurationMs.WithLabelValues(shortName).Observe(float64(durationMs))
-		return store.Result{}, fmt.Errorf("runner [%s]: parsing output: %w (stdout=%q)", image, parseErr, stdout.String())
+		metrics.BlockVerifiedTotal.WithLabelValues(spec.Name, "error").Inc()
+		metrics.VerificationDurationMs.WithLabelValues(spec.Name).Observe(float64(durationMs))
+		return store.Result{}, fmt.Errorf("runner [%s]: parsing output: %w (stdout=%q)", spec.Name, parseErr, stdout.String())
 	}
 
 	result := "ok"
 	if !line.Valid {
 		result = "fail"
 	}
-	metrics.BlockVerifiedTotal.WithLabelValues(shortName, result).Inc()
-	metrics.VerificationDurationMs.WithLabelValues(shortName).Observe(float64(durationMs))
+	metrics.BlockVerifiedTotal.WithLabelValues(spec.Name, result).Inc()
+	metrics.VerificationDurationMs.WithLabelValues(spec.Name).Observe(float64(durationMs))
 
 	return store.Result{
 		Block:         line.Block,
-		Guest:         shortName,
+		Guest:         spec.Name,
 		Valid:         line.Valid,
 		PreStateRoot:  line.PreStateRoot,
 		PostStateRoot: line.PostStateRoot,
@@ -107,18 +139,4 @@ func lastJSONLine(buf []byte) (guestResult, error) {
 		return r, nil
 	}
 	return guestResult{}, io.EOF
-}
-
-// shortImage strips registry/tag noise for use as a label value.
-// "ghcr.io/consensys/zevm-stateless:latest" → "zevm-stateless"
-func shortImage(image string) string {
-	// Drop registry prefix (everything before last slash before colon).
-	if idx := strings.LastIndex(image, "/"); idx >= 0 {
-		image = image[idx+1:]
-	}
-	// Drop tag.
-	if idx := strings.Index(image, ":"); idx >= 0 {
-		image = image[:idx]
-	}
-	return image
 }

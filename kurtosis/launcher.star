@@ -3,58 +3,74 @@ HTTP_PORT_ID = "http"
 HTTP_PORT_NUM = 8080
 
 DEFAULT_IMAGE = "ghcr.io/eth-proofs/stateless-executor:latest"
-DEFAULT_GUEST_IMAGES = ["ghcr.io/eth-proofs/zevm-stateless:latest"]
+
+# Default guest: zevm-stateless binary inside the zevm-stateless image.
+DEFAULT_GUESTS = [
+    struct(
+        image="ghcr.io/eth-proofs/zevm-stateless:latest",
+        binary="/usr/local/bin/zevm-stateless",
+    ),
+]
 
 
 def launch(
     plan,
     all_el_contexts,
     image=DEFAULT_IMAGE,
-    guest_images=DEFAULT_GUEST_IMAGES,
+    guests=DEFAULT_GUESTS,
     fork_name="",
-    docker_host="",
 ):
     """Launch the stateless-executor service.
 
-    The executor watches the EL pool for new block heads, fetches each block's
-    RLP + execution witness, encodes them in the binary format expected by
-    zevm-stateless guests, runs each guest image via Docker, and exposes:
-      GET /metrics  — Prometheus exposition
-      GET /results  — JSON array of the last 1000 verification results
-
-    NOTE on Docker access: the executor calls `docker run` internally to
-    execute guest images. When running inside Kurtosis the container cannot
-    reach the host Docker socket by default. Two options:
-      1. Pass docker_host="tcp://host.docker.internal:2375" to use a TCP
-         Docker daemon reachable from within the enclave.
-      2. For production deployments, mount /var/run/docker.sock via a
-         docker-compose override or Kubernetes hostPath volume.
+    For each guest, the launcher pulls the guest image via plan.run_sh,
+    extracts the binary into a Kurtosis artifact, and mounts it into the
+    executor container. The executor runs the binary directly — no Docker
+    daemon is needed inside the container.
 
     Args:
         plan:             Kurtosis plan object
         all_el_contexts:  List of EL context objects (must have .rpc_http_url)
         image:            Executor docker image
-        guest_images:     List of guest images to verify against each block
+        guests:           List of structs with fields:
+                            image  (str) — Docker image containing the guest binary
+                            binary (str) — absolute path to the binary inside the image
         fork_name:        Optional fork override passed to guests (e.g. "cancun")
-        docker_host:      Optional DOCKER_HOST env var (e.g. "tcp://host.docker.internal:2375")
 
     Returns:
         Struct with service_name, ip_address, http_url, metrics_url, results_url
     """
-    if len(guest_images) == 0:
-        fail("stateless-executor: guest_images must not be empty")
+    if len(guests) == 0:
+        fail("stateless-executor: guests must not be empty")
 
     el_rpc_urls = ",".join([ctx.rpc_http_url for ctx in all_el_contexts])
-    guest_images_str = ",".join(guest_images)
+
+    # Extract each guest binary from its image and collect mount info.
+    files = {}
+    guest_specs = []  # "name:/mount/path/binary"
+
+    for i, guest in enumerate(guests):
+        name = _short_name(guest.image)
+        bin_name = guest.binary.split("/")[-1]
+        mount_dir = "/guests/{0}".format(i)
+        mount_path = "{0}/{1}".format(mount_dir, bin_name)
+
+        artifact = plan.run_sh(
+            name="extract-guest-{0}".format(name),
+            description="Extracting {0} binary from {1}".format(bin_name, guest.image),
+            image=guest.image,
+            run="cp {0} /tmp/{1} && chmod +x /tmp/{1}".format(guest.binary, bin_name),
+            store=["/tmp/{0}".format(bin_name)],
+        )
+
+        files[mount_dir] = artifact.files_artifacts[0]
+        guest_specs.append("{0}:{1}".format(name, mount_path))
 
     env_vars = {
         "EL_RPC_URLS": el_rpc_urls,
-        "GUEST_IMAGES": guest_images_str,
+        "GUEST_BINARIES": ",".join(guest_specs),
     }
     if fork_name != "":
         env_vars["FORK_NAME"] = fork_name
-    if docker_host != "":
-        env_vars["DOCKER_HOST"] = docker_host
 
     config = ServiceConfig(
         image=image,
@@ -66,6 +82,7 @@ def launch(
             ),
         },
         env_vars=env_vars,
+        files=files,
     )
 
     service = plan.add_service(SERVICE_NAME, config)
@@ -80,3 +97,13 @@ def launch(
         metrics_url="{0}/metrics".format(http_url),
         results_url="{0}/results".format(http_url),
     )
+
+
+def _short_name(image):
+    """ghcr.io/eth-proofs/zevm-stateless:latest -> zevm-stateless"""
+    name = image
+    if "/" in name:
+        name = name.split("/")[-1]
+    if ":" in name:
+        name = name.split(":")[0]
+    return name

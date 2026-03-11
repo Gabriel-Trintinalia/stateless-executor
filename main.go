@@ -23,19 +23,22 @@ import (
 func main() {
 	// ── Config from environment ────────────────────────────────────────────────
 	elURLs := splitEnv("EL_RPC_URLS")
-	guestImages := splitEnv("GUEST_IMAGES")
-	forkName := os.Getenv("FORK_NAME") // optional, e.g. "cancun"
+	forkName := os.Getenv("FORK_NAME")
 	listenAddr := envOr("LISTEN_ADDR", ":8080")
 
 	if len(elURLs) == 0 {
 		log.Fatal("EL_RPC_URLS is required (comma-separated list of RPC endpoints)")
 	}
-	if len(guestImages) == 0 {
-		log.Fatal("GUEST_IMAGES is required (comma-separated list of docker images)")
+
+	guests, err := runner.ParseGuestSpecs(os.Getenv("GUEST_BINARIES"))
+	if err != nil {
+		log.Fatalf("GUEST_BINARIES: %v", err)
 	}
 
-	log.Printf("EL nodes:     %v", elURLs)
-	log.Printf("Guest images: %v", guestImages)
+	log.Printf("EL nodes: %v", elURLs)
+	for _, g := range guests {
+		log.Printf("guest:    %s → %s", g.Name, g.Path)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -84,44 +87,41 @@ func main() {
 				log.Printf("block #%d: fetch error: %v", blockNum, err)
 				continue
 			}
-			log.Printf("block #%d: encoded %d bytes, fanning out to %d guest(s)", blockNum, len(input), len(guestImages))
+			log.Printf("block #%d: encoded %d bytes, fanning out to %d guest(s)", blockNum, len(input), len(guests))
 
-			// Fan out to all guest images in parallel.
 			var wg sync.WaitGroup
-			for _, image := range guestImages {
+			for _, g := range guests {
 				wg.Add(1)
-				go func(img string) {
+				go func(spec runner.GuestSpec) {
 					defer wg.Done()
 					runCtx, runCancel := context.WithTimeout(ctx, 5*time.Minute)
 					defer runCancel()
 
-					result, err := runner.Run(runCtx, img, input, forkName)
+					result, err := runner.Run(runCtx, spec, input, forkName)
 					if err != nil {
-						log.Printf("block #%d [%s]: runner error: %v", blockNum, img, err)
+						log.Printf("block #%d [%s]: runner error: %v", blockNum, spec.Name, err)
 						return
 					}
 					buf.Add(result)
 					if result.Valid {
-						log.Printf("block #%d [%s]: OK (%dms)", blockNum, img, result.DurationMs)
+						log.Printf("block #%d [%s]: OK (%dms)", blockNum, spec.Name, result.DurationMs)
 					} else {
-						log.Printf("block #%d [%s]: FAIL (%dms)", blockNum, img, result.DurationMs)
+						log.Printf("block #%d [%s]: FAIL (%dms)", blockNum, spec.Name, result.DurationMs)
 					}
-				}(image)
+				}(g)
 			}
 			wg.Wait()
 		}
 	}
 }
 
-// splitEnv splits a comma-separated environment variable, trimming spaces.
 func splitEnv(key string) []string {
 	val := os.Getenv(key)
 	if val == "" {
 		return nil
 	}
-	parts := strings.Split(val, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
+	var out []string
+	for _, p := range strings.Split(val, ",") {
 		if s := strings.TrimSpace(p); s != "" {
 			out = append(out, s)
 		}
