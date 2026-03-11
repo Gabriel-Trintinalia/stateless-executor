@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Gabriel-Trintinalia/stateless-executor/metrics"
 )
 
 const (
@@ -86,6 +87,7 @@ func New(urls []string) (*Pool, error) {
 
 		if len(healthy) > 0 {
 			p.nodes = healthy
+			metrics.ELPoolSize.Set(float64(len(healthy)))
 			return p, nil
 		}
 
@@ -159,6 +161,7 @@ func (p *Pool) Remove(url string) {
 		}
 	}
 	p.nodes = updated
+	metrics.ELPoolSize.Set(float64(len(p.nodes)))
 	log.Printf("pool: removed %s (%d node(s) remaining)", url, len(p.nodes))
 }
 

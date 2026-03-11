@@ -13,6 +13,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/Gabriel-Trintinalia/stateless-executor/metrics"
 	"github.com/Gabriel-Trintinalia/stateless-executor/pipeline"
 	"github.com/Gabriel-Trintinalia/stateless-executor/pool"
 	"github.com/Gabriel-Trintinalia/stateless-executor/runner"
@@ -76,6 +77,7 @@ func main() {
 			return
 
 		case blockNum := <-p.Heads:
+			metrics.BlockHeight.Set(float64(blockNum))
 			log.Printf("block #%d: fetching", blockNum)
 
 			fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
