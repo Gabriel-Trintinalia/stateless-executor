@@ -17,10 +17,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rlp"
 
 	"github.com/Gabriel-Trintinalia/stateless-executor/pool"
 )
@@ -65,15 +67,11 @@ func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64) ([]byte, string, 
 		return nil, elNode, fmt.Errorf("pipeline: decoding witness JSON: %w", err)
 	}
 
-	// Decode headers: some clients return []hex-string; others (e.g. geth) return
-	// an array of full header objects. If format is wrong, remove from pool.
-	headers, formatOK, err := decodeHeaders(w.Headers)
+	// Decode headers: reth/besu return []hex-string; geth returns []header-object.
+	// Both are normalised to [][]byte (RLP-encoded headers).
+	headers, err := decodeHeaders(w.Headers)
 	if err != nil {
 		return nil, elNode, fmt.Errorf("pipeline: decoding headers: %w", err)
-	}
-	if !formatOK {
-		log.Printf("pipeline: %s returned unsupported witness format; removing from pool", elNode)
-		p.Remove(rawURL)
 	}
 
 	encoded, err := encode(blockRLP, w, headers)
@@ -110,21 +108,31 @@ func encode(blockRLP []byte, w witness, headers [][]byte) ([]byte, error) {
 }
 
 // decodeHeaders parses the headers field from debug_executionWitness.
-// Returns the decoded bytes, a boolean indicating whether the format was
-// recognised (false = unsupported, caller should remove that node), and any
-// decode error.
-func decodeHeaders(raw json.RawMessage) ([][]byte, bool, error) {
+// Reth/besu return []hex-string (RLP-encoded); geth returns []header-object.
+// Both are normalised to raw RLP bytes.
+func decodeHeaders(raw json.RawMessage) ([][]byte, error) {
 	if len(raw) == 0 || string(raw) == "null" || string(raw) == "[]" {
-		return nil, true, nil
+		return nil, nil
 	}
-	// Expected format: []hex-string (besu, reth).
+	// Reth/besu format: []hex-string, each already RLP-encoded.
 	var hexStrs []string
 	if err := json.Unmarshal(raw, &hexStrs); err == nil {
-		decoded, err := decodeHexArray(hexStrs)
-		return decoded, true, err
+		return decodeHexArray(hexStrs)
 	}
-	// Unsupported format (e.g. geth returns full header objects).
-	return nil, false, nil
+	// Geth format: []header-object — unmarshal and RLP-encode each one.
+	var headers []*types.Header
+	if err := json.Unmarshal(raw, &headers); err != nil {
+		return nil, fmt.Errorf("unrecognised headers format: %w", err)
+	}
+	out := make([][]byte, len(headers))
+	for i, h := range headers {
+		b, err := rlp.EncodeToBytes(h)
+		if err != nil {
+			return nil, fmt.Errorf("RLP-encoding header %d: %w", i, err)
+		}
+		out[i] = b
+	}
+	return out, nil
 }
 
 // writeArray writes [u64 count] followed by [u64 len][bytes] for each element.

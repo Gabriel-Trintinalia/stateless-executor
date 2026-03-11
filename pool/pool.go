@@ -150,20 +150,6 @@ func (p *Pool) Pick() string {
 	return p.next()
 }
 
-// Remove permanently drops a URL from the pool (e.g. unsupported witness format).
-func (p *Pool) Remove(url string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	updated := p.nodes[:0]
-	for _, u := range p.nodes {
-		if u != url {
-			updated = append(updated, u)
-		}
-	}
-	p.nodes = updated
-	metrics.ELPoolSize.Set(float64(len(p.nodes)))
-	log.Printf("pool: removed %s (%d node(s) remaining)", url, len(p.nodes))
-}
 
 // probe calls debug_executionWitness on "latest" and returns true if supported.
 func probe(url string) bool {
