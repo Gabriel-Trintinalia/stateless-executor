@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/eth-proofs/stateless-executor/metrics"
-	"github.com/eth-proofs/stateless-executor/store"
+	"github.com/Gabriel-Trintinalia/stateless-executor/metrics"
+	"github.com/Gabriel-Trintinalia/stateless-executor/store"
 )
 
 // GuestSpec identifies a guest binary by name and filesystem path.

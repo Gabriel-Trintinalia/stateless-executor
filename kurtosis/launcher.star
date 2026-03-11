@@ -2,7 +2,7 @@ SERVICE_NAME = "stateless-executor"
 HTTP_PORT_ID = "http"
 HTTP_PORT_NUM = 8080
 
-DEFAULT_IMAGE = "ghcr.io/eth-proofs/stateless-executor:latest"
+DEFAULT_IMAGE = "ghcr.io/Gabriel-Trintinalia/stateless-executor:latest"
 
 # Default guest: zevm-stateless binary inside the zevm-stateless image.
 DEFAULT_GUESTS = [

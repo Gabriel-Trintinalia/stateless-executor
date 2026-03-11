@@ -13,11 +13,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/eth-proofs/stateless-executor/metrics"
-	"github.com/eth-proofs/stateless-executor/pipeline"
-	"github.com/eth-proofs/stateless-executor/pool"
-	"github.com/eth-proofs/stateless-executor/runner"
-	"github.com/eth-proofs/stateless-executor/store"
+	"github.com/Gabriel-Trintinalia/stateless-executor/metrics"
+	"github.com/Gabriel-Trintinalia/stateless-executor/pipeline"
+	"github.com/Gabriel-Trintinalia/stateless-executor/pool"
+	"github.com/Gabriel-Trintinalia/stateless-executor/runner"
+	"github.com/Gabriel-Trintinalia/stateless-executor/store"
 )
 
 func main() {

@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/eth-proofs/stateless-executor/metrics"
+	"github.com/Gabriel-Trintinalia/stateless-executor/metrics"
 )
 
 const (

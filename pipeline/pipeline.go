@@ -20,7 +20,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/eth-proofs/stateless-executor/pool"
+	"github.com/Gabriel-Trintinalia/stateless-executor/pool"
 )
 
 // witness mirrors the JSON returned by debug_executionWitness.

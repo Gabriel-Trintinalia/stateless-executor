@@ -1,4 +1,4 @@
-module github.com/eth-proofs/stateless-executor
+module github.com/Gabriel-Trintinalia/stateless-executor
 
 go 1.22
 
