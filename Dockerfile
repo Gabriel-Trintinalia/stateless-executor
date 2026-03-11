@@ -5,7 +5,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o stateless-executor .
 
-FROM alpine:3.20
+FROM debian:bookworm-slim
 COPY --from=builder /src/stateless-executor /usr/local/bin/stateless-executor
 EXPOSE 8080
 ENTRYPOINT ["stateless-executor"]
