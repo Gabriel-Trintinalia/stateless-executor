@@ -14,6 +14,7 @@ type Result struct {
 	WitnessFrom   string `json:"witness_from"`
 	Valid         bool   `json:"valid"`
 	Error         string `json:"error,omitempty"`
+	Log           string `json:"log,omitempty"`
 	PreStateRoot  string `json:"pre_state_root,omitempty"`
 	PostStateRoot string `json:"post_state_root,omitempty"`
 	ReceiptsRoot  string `json:"receipts_root,omitempty"`
