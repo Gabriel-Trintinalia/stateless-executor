@@ -55,11 +55,8 @@ func ParseGuestSpecs(s string) ([]GuestSpec, error) {
 
 // guestResult is the JSON line emitted by the guest to stdout.
 type guestResult struct {
-	Block         uint64 `json:"block"`
-	Valid         bool   `json:"valid"`
-	PreStateRoot  string `json:"pre_state_root"`
-	PostStateRoot string `json:"post_state_root"`
-	ReceiptsRoot  string `json:"receipts_root"`
+	Block uint64 `json:"block"`
+	Valid bool   `json:"valid"`
 }
 
 // Run executes the guest binary at spec.Path, feeding input via stdin, and
@@ -115,14 +112,11 @@ func Run(ctx context.Context, spec GuestSpec, input []byte, forkName string) (st
 	metrics.VerificationDurationMs.WithLabelValues(spec.Name).Observe(float64(durationMs))
 
 	return store.Result{
-		Block:         line.Block,
-		Guest:         spec.Name,
-		Valid:         line.Valid,
-		Log:           logOutput,
-		PreStateRoot:  line.PreStateRoot,
-		PostStateRoot: line.PostStateRoot,
-		ReceiptsRoot:  line.ReceiptsRoot,
-		DurationMs:    durationMs,
+		Block:      line.Block,
+		Guest:      spec.Name,
+		Valid:      line.Valid,
+		Log:        logOutput,
+		DurationMs: durationMs,
 	}, nil
 }
 

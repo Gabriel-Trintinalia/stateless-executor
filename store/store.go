@@ -15,9 +15,8 @@ type Result struct {
 	Valid         bool   `json:"valid"`
 	Error         string `json:"error,omitempty"`
 	Log           string `json:"log,omitempty"`
-	PreStateRoot  string `json:"pre_state_root,omitempty"`
-	PostStateRoot string `json:"post_state_root,omitempty"`
-	ReceiptsRoot  string `json:"receipts_root,omitempty"`
+	TxCount       int    `json:"tx_count"`
+	GasUsed       uint64 `json:"gas_used"`
 	DurationMs    int64  `json:"duration_ms"`
 }
 

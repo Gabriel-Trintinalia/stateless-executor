@@ -28,6 +28,12 @@ import (
 	"github.com/Gabriel-Trintinalia/stateless-executor/pool"
 )
 
+// BlockMeta holds lightweight block metadata derived from the fetched block RLP.
+type BlockMeta struct {
+	TxCount int
+	GasUsed uint64
+}
+
 // witness mirrors the JSON returned by debug_executionWitness.
 type witness struct {
 	State   []string        `json:"state"`
@@ -37,12 +43,12 @@ type witness struct {
 }
 
 // Fetch retrieves the block RLP and witness for blockNum, then encodes them
-// into the binary guest input format. Returns the encoded bytes and the EL
-// node hostname that served the witness.
-func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64) ([]byte, string, error) {
+// into the binary guest input format. Returns the encoded bytes, the EL
+// node hostname that served the witness, and lightweight block metadata.
+func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64) ([]byte, string, BlockMeta, error) {
 	rawURL := p.Pick()
 	if rawURL == "" {
-		return nil, "", fmt.Errorf("pipeline: no healthy EL node available")
+		return nil, "", BlockMeta{}, fmt.Errorf("pipeline: no healthy EL node available")
 	}
 	elNode := hostname(rawURL)
 
@@ -51,35 +57,43 @@ func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64) ([]byte, string, 
 	// Fetch raw block RLP.
 	rawBlockResult, err := p.CallRaw(ctx, rawURL, "debug_getRawBlock", []interface{}{hexNum})
 	if err != nil {
-		return nil, elNode, fmt.Errorf("pipeline: debug_getRawBlock(%d): %w", blockNum, err)
+		return nil, elNode, BlockMeta{}, fmt.Errorf("pipeline: debug_getRawBlock(%d): %w", blockNum, err)
 	}
 	blockRLP, err := decodeHexResult(rawBlockResult)
 	if err != nil {
-		return nil, elNode, fmt.Errorf("pipeline: decoding block RLP: %w", err)
+		return nil, elNode, BlockMeta{}, fmt.Errorf("pipeline: decoding block RLP: %w", err)
+	}
+
+	// Decode block RLP to extract metadata.
+	var meta BlockMeta
+	var block types.Block
+	if err := rlp.DecodeBytes(blockRLP, &block); err == nil {
+		meta.TxCount = block.Transactions().Len()
+		meta.GasUsed = block.GasUsed()
 	}
 
 	// Fetch execution witness.
 	witnessResult, err := p.CallRaw(ctx, rawURL, "debug_executionWitness", []interface{}{hexNum})
 	if err != nil {
-		return nil, elNode, fmt.Errorf("pipeline: debug_executionWitness(%d): %w", blockNum, err)
+		return nil, elNode, meta, fmt.Errorf("pipeline: debug_executionWitness(%d): %w", blockNum, err)
 	}
 	var w witness
 	if err := json.Unmarshal(witnessResult, &w); err != nil {
-		return nil, elNode, fmt.Errorf("pipeline: decoding witness JSON: %w", err)
+		return nil, elNode, meta, fmt.Errorf("pipeline: decoding witness JSON: %w", err)
 	}
 
 	// Decode headers: reth/besu return []hex-string; geth returns []header-object.
 	// Both are normalised to [][]byte (RLP-encoded headers).
 	headers, err := decodeHeaders(w.Headers)
 	if err != nil {
-		return nil, elNode, fmt.Errorf("pipeline: decoding headers: %w", err)
+		return nil, elNode, meta, fmt.Errorf("pipeline: decoding headers: %w", err)
 	}
 
 	log.Printf("block #%d [%s]: witness state=%d codes=%d keys=%d headers=%d (raw=%s)",
 		blockNum, elNode, len(w.State), len(w.Codes), len(w.Keys), len(headers), w.Headers)
 
 	encoded, err := encode(blockRLP, w, headers)
-	return encoded, elNode, err
+	return encoded, elNode, meta, err
 }
 
 // encode serialises blockRLP + witness into the binary guest format.

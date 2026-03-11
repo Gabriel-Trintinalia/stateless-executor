@@ -81,7 +81,7 @@ func main() {
 			log.Printf("block #%d: fetching", blockNum)
 
 			fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
-			input, elNode, err := pipeline.Fetch(fetchCtx, p, blockNum)
+			input, elNode, meta, err := pipeline.Fetch(fetchCtx, p, blockNum)
 			fetchCancel()
 			if err != nil {
 				log.Printf("block #%d: fetch error: %v", blockNum, err)
@@ -99,6 +99,8 @@ func main() {
 
 					result, err := runner.Run(runCtx, spec, input, forkName)
 					result.WitnessFrom = elNode
+					result.TxCount = meta.TxCount
+					result.GasUsed = meta.GasUsed
 					if err != nil {
 						result.Block = blockNum
 						result.Guest = spec.Name
