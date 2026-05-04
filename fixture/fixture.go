@@ -1,7 +1,7 @@
 // Package fixture parses the stateless-validator JSON fixture format
 // (produced by the reth/alloy serde_bincode_compat::Block serializer —
 // snake_case field names, mixed int/hex types) and re-encodes blocks as
-// the zesu-zkvm RLP binary format consumed by ziskemu.
+// the zesu-zkvm SSZ binary format consumed by ziskemu.
 package fixture
 
 import (
@@ -13,6 +13,7 @@ import (
 // FixtureFile is the top-level JSON fixture format.
 type FixtureFile struct {
 	Name           string         `json:"name"`
+	Network        string         `json:"network"`
 	StatelessInput StatelessInput `json:"stateless_input"`
 	Success        bool           `json:"success"`
 }
@@ -63,14 +64,16 @@ type FixtureHeader struct {
 	ExcessBlobGas         *uint64          `json:"excess_blob_gas"`
 	ParentBeaconBlockRoot *string          `json:"parent_beacon_block_root"`
 	RequestsHash          *string          `json:"requests_hash"`
+	SlotNumber            *uint64          `json:"slot_number"`
 	ExtraData             string           `json:"extra_data"`
 }
 
 // FixtureBody holds the block body (transactions, ommers, withdrawals).
 type FixtureBody struct {
-	Transactions []FixtureTx         `json:"transactions"`
-	Ommers       []json.RawMessage   `json:"ommers"` // always empty for post-merge
-	Withdrawals  []FixtureWithdrawal `json:"withdrawals"`
+	Transactions    []FixtureTx         `json:"transactions"`
+	Ommers          []json.RawMessage   `json:"ommers"` // always empty for post-merge
+	Withdrawals     []FixtureWithdrawal `json:"withdrawals"`
+	BlockAccessList *string             `json:"block_access_list"` // hex-encoded RLP bytes; nil for pre-Amsterdam
 }
 
 // FixtureTx wraps a signature and a discriminated-union transaction.
@@ -195,3 +198,50 @@ func LoadFile(path string) (*FixtureFile, error) {
 	}
 	return &f, nil
 }
+
+// ZkevmWitness holds the execution witness arrays from a zkevm blockchain test block.
+type ZkevmWitness struct {
+	State   []string `json:"state"`
+	Codes   []string `json:"codes"`
+	Headers []string `json:"headers"`
+}
+
+// ZkevmBlock is one block inside a zkevm blockchain test case.
+type ZkevmBlock struct {
+	ExecutionWitness     ZkevmWitness `json:"executionWitness"`
+	StatelessInputBytes  string       `json:"statelessInputBytes"`  // hex-encoded SSZ SszStatelessInput (Amsterdam+)
+	StatelessOutputBytes string       `json:"statelessOutputBytes"` // hex-encoded expected SSZ output
+	// ExpectException is non-empty for blocks that are expected to be invalid.
+	ExpectException string `json:"expectException"`
+}
+
+// ZkevmTestCase is one test case in the zkevm blockchain test format.
+type ZkevmTestCase struct {
+	Name    string       // top-level key from the JSON file
+	Network string       `json:"network"`
+	Blocks  []ZkevmBlock `json:"blocks"`
+}
+
+// LoadZkevmFile reads a zkevm blockchain test JSON file and returns all test cases.
+// The format has one or more top-level keys, each naming a test case.
+func LoadZkevmFile(path string) ([]*ZkevmTestCase, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	var out []*ZkevmTestCase
+	for name, v := range raw {
+		var tc ZkevmTestCase
+		if err := json.Unmarshal(v, &tc); err != nil {
+			return nil, fmt.Errorf("parse test %q in %s: %w", name, path, err)
+		}
+		tc.Name = name
+		out = append(out, &tc)
+	}
+	return out, nil
+}
+
