@@ -23,7 +23,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	data, err := fixture.ZesuInput(f)
+	data, err := fixture.ZesuInputSSZ(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "encode: %v\n", err)
 		os.Exit(1)

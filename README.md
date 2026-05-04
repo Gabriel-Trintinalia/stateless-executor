@@ -1,6 +1,13 @@
 # stateless-executor
 
-Continuous stateless block verification pipeline. Watches a live Ethereum network for new blocks, fetches each block's RLP and execution witness, and runs one or more zkVM guest programs against every block — reporting results in real time via Grafana.
+Tools and services for stateless block verification of Ethereum blocks against zkVM guest programs.
+
+This repo contains two largely independent halves:
+
+- **Live pipeline** (`main.go`, `pool/`, `pipeline/`, `runner/`, `store/`, `metrics/`) — watches a live Ethereum network for new blocks, fetches each block's RLP and execution witness, and runs one or more zkVM guests in real time, reporting via Grafana.
+- **Offline tooling** (`bench/`, `cmd/zesu-convert/`, `cmd/zkevm-runner/`) — batch-runs JSON fixtures through ziskemu against a built `zesu-zkvm` ELF and produces benchmark reports / pass-fail tables.
+
+> **Status**: the live pipeline still emits the legacy zevm-zisk RLP `StatelessInput` envelope and is therefore broken end-to-end against the current SSZ-only `zesu-zkvm` guest. The offline tooling has been migrated to SSZ.
 
 ## Quickstart
 
@@ -65,7 +72,7 @@ stateless_executor_params:
 
 Guest binaries receive block data on **stdin** and write the result to **stdout**:
 
-- **stdin** — binary-encoded block input: `[u64 rlp_len][rlp][state][codes][keys][headers]`
+- **stdin** — binary-encoded block input. The live pipeline currently emits the legacy zevm-zisk RLP `StatelessInput` envelope; the offline tools (`zesu-convert`, `bench`, `zkevm-runner`) emit the Amsterdam SSZ `SszStatelessInput` envelope consumed by the SSZ-only `zesu-zkvm` guest.
 - **stdout** — one JSON line: `{"block": N, "valid": true}`
 - **stderr** — informational, captured and shown in the `log` column
 
@@ -111,53 +118,45 @@ EL node pool  ──►  fetch block RLP + witness  ──►  encode binary  �
                                                                        parallel)
 ```
 
-## zesu-zkvm tooling
+## zesu-zkvm tooling (offline, SSZ-only)
 
-Two CLI tools support offline benchmarking of the zesu-zkvm guest binary against mainnet block fixtures.
+Three CLI tools that build SSZ inputs from JSON fixtures and run them through ziskemu against a `zesu-zkvm` guest ELF. All three target the Amsterdam-spec `SszStatelessInput` envelope; the legacy RLP path has been removed.
+
+All three build into `./bin/`. Build everything in one go:
+
+```bash
+go build -o bin/zesu-convert ./cmd/zesu-convert
+go build -o bin/bench        ./bench
+go build -o bin/zkevm-runner ./cmd/zkevm-runner
+```
 
 ### `zesu-convert` — fixture to binary
 
-Reads one JSON block fixture and writes the ziskemu-ready binary input to a file (or stdout).
+Reads one JSON block fixture and writes the ziskemu-ready SSZ binary input to a file (or stdout).
 
 ```
 zesu-convert <fixture.json> [output.bin]
 zesu-convert <fixture.json> > output.bin
 ```
 
-**Build**
-
-```bash
-go build -o zesu-convert ./cmd/zesu-convert
-```
-
 **Example**
 
 ```bash
-./zesu-convert rpc_block_24758569.json block_24758569.bin
-# stderr: ok: 4625040 bytes, block=24758569 txns=156
-```
+./bin/zesu-convert rpc_block_24758569.json block_24758569.bin
+# stderr: ok: <N> bytes, block=24758569 txns=156
 
-The output file can then be fed directly to `ziskemu`:
-
-```bash
-ziskemu-0.16.1 -X -e zesu-zisk -i block_24758569.bin
+ziskemu -X -e zesu-zisk -i block_24758569.bin
 ```
 
 **Output format**
 
 ```
-[u64 LE: payload_len]
-[32 bytes: new_payload_request_root (zeros — placeholder)]
-[u64 BE: block_rlp_len] [block RLP]
-[u64: state_count]   [u64 len + node bytes] × N
-[u64: codes_count]   [u64 len + code bytes] × N
-[u64: keys_count]    [u64 len + key bytes]  × N
-[u64: headers_count] [u64 len + header RLP] × N
-[u64: pubkeys_count] [u64 len + 64-byte pubkey] × N
+[u64 LE: ssz_content_len]
+[SszStatelessInput bytes]
 [0–7 zero bytes: alignment padding to multiple of 8]
 ```
 
-The block RLP and public keys are derived automatically from the JSON fixture — no pre-processing needed.
+Transactions, the SSZ container layout, and pre-computed values are derived from the JSON fixture — no pre-processing needed.
 
 ---
 
@@ -173,23 +172,16 @@ bench --fixtures <dir> --elf <path> [--ziskemu <path>] [--jobs N] [--report <pat
 |---|---|---|
 | `--fixtures` | *(required)* | Directory containing `*.json` fixture files, or a single file |
 | `--elf` | *(required)* | Path to the compiled `zesu-zisk` ELF binary |
-| `--ziskemu` | `ziskemu-0.16.1` | Path to the ziskemu emulator binary |
+| `--ziskemu` | `ziskemu` | Path to the ziskemu emulator binary (zisk-0.17+; `ziskup --cpu` puts it on PATH) |
 | `--jobs` | `1` | Number of parallel ziskemu runs |
 | `--report` | `bench_report.html` | Output path for the HTML report |
-
-**Build**
-
-```bash
-go build -o bench ./bench
-```
 
 **Example**
 
 ```bash
-./bench \
-  --fixtures ~/ere-input-testing/blocks_500_mainnet_Q12026 \
-  --elf ~/dev/stateless/zesu-zkvm/zig-out/bin/zesu-zisk \
-  --ziskemu ~/dev/stateless/ziskemu-0.16.1 \
+./bin/bench \
+  --fixtures ~/blocks_500_mainnet_Q12026 \
+  --elf ~/dev/zesu-zkvm/zisk/zig-out/bin/zesu-zisk \
   --jobs 4 \
   --report bench_report.html
 ```
@@ -218,15 +210,53 @@ Opens in any browser. Contains the cost summary table, a line chart of total cos
 
 ---
 
+### `zkevm-runner` — run zkevm spec-test fixtures
+
+Reads zkevm blockchain-test JSON fixtures (one or more test cases, one or more blocks per case) and runs each block through ziskemu, comparing the guest's 41-byte SSZ output against the fixture's `statelessOutputBytes` and the success flag against `expectException`.
+
+Pre-Amsterdam fixtures (no `statelessInputBytes`) are not supported — the SSZ-only guest needs the SSZ envelope from the fixture.
+
+```
+zkevm-runner --fixtures <dir> --elf <path> [--ziskemu <path>] [--jobs N] [--report <path>]
+zkevm-runner --fixtures <dir> --dump-dir <out>   # encode .bin files without running ziskemu
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--fixtures` | *(required)* | Directory containing zkevm `*.json` fixture files |
+| `--elf` | *(required unless `--dump-dir` is set)* | Path to the compiled `zesu-zisk` ELF binary |
+| `--ziskemu` | `ziskemu` | Path to the ziskemu emulator binary (zisk-0.17+; `ziskup --cpu` puts it on PATH) |
+| `--jobs` | `1` | Number of parallel ziskemu runs |
+| `--report` | *(optional)* | If set, writes an HTML report with pass/fail/error tables |
+| `--dump-dir` | *(optional)* | Encode each block's input to `.bin` files in this directory and skip execution |
+
+**Example**
+
+```bash
+./bin/zkevm-runner \
+  --fixtures ~/dev/zesu/spec-tests/fixtures/zkevm/blockchain_tests \
+  --elf ~/dev/zesu-zkvm/zisk/zig-out/bin/zesu-zisk \
+  --jobs 4 \
+  --report zkevm_report.html
+```
+
+The terminal prints one line per test block (`OK` / validation failure / error) followed by a summary; the optional HTML report tabulates each failing block with the expected vs actual SSZ output and the parsed error line from ziskemu.
+
+---
+
 ## Project structure
 
 ```
 stateless-executor/
-├── main.go       # entry point, wiring
-├── pool/         # EL RPC pool — probes debug_executionWitness, polls heads
-├── pipeline/     # fetches block RLP + witness, encodes binary input
-├── runner/       # executes guest binaries, parses JSON output
-├── store/        # ring buffer + /results HTTP handler
-├── metrics/      # Prometheus metrics
+├── main.go                # live-pipeline entry point (currently RLP-only — broken vs SSZ guest)
+├── pool/                  # EL RPC pool — probes debug_executionWitness, polls heads
+├── pipeline/              # fetches block RLP + witness, encodes binary input
+├── runner/                # executes guest binaries, parses JSON output
+├── store/                 # ring buffer + /results HTTP handler
+├── metrics/               # Prometheus metrics
+├── fixture/               # JSON-fixture parsing + SSZ encoding shared by the offline tools
+├── bench/                 # offline benchmark runner
+├── cmd/zesu-convert/      # one-shot fixture-to-bin converter
+├── cmd/zkevm-runner/      # zkevm spec-test fixture runner
 └── Dockerfile
 ```

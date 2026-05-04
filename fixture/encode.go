@@ -11,242 +11,27 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
 )
 
-// ZesuInput encodes a fixture as a ziskemu-ready input file:
-//
-//	[u64 LE: payload_len] [RLP binary format]
-//
-// RLP binary format = zevm-stateless encoding (same layout as pipeline encodeRLP,
-// including pre-recovered public keys so the guest can skip ECRECOVER).
-//
-// The guest reads input via zkvm_io.read_input_slice() which returns the bytes
-// starting at offset 16 of the Zisk input region — i.e. exactly the payload.
-// deserialize.fromBytes() then parses starting at byte 0 of that slice.
-func ZesuInput(f *FixtureFile) ([]byte, error) {
-	blockRLP, txs, err := blockRLPAndTxs(f.StatelessInput.Block)
+// ZesuInputFromZkevmBlock encodes a single zkevm blockchain test block as a
+// ziskemu-ready binary input. Requires the fixture to carry pre-encoded SSZ
+// statelessInputBytes (Amsterdam+); pre-Amsterdam fixtures are unsupported.
+func ZesuInputFromZkevmBlock(tc *ZkevmTestCase, block *ZkevmBlock) ([]byte, bool, error) {
+	expectedSuccess := block.ExpectException == ""
+	if block.StatelessInputBytes == "" {
+		return nil, expectedSuccess, fmt.Errorf("statelessInputBytes missing — only SSZ fixtures are supported")
+	}
+	payload, contentLen, err := injectForkName(block.StatelessInputBytes, tc.Network)
 	if err != nil {
-		return nil, fmt.Errorf("block RLP: %w", err)
+		return nil, false, fmt.Errorf("inject fork name: %w", err)
 	}
-
-	pubKeys, err := recoverPublicKeys(txs)
-	if err != nil {
-		return nil, fmt.Errorf("recover public keys: %w", err)
-	}
-
-	payload, err := encodeZesuRLP(blockRLP, f.StatelessInput.Witness, pubKeys)
-	if err != nil {
-		return nil, fmt.Errorf("encode RLP payload: %w", err)
-	}
-
-	// zesu-zkvm/src/main.zig expects input_data[0..32] = new_payload_request_root
-	// (SSZ hash-tree-root of NewPayloadRequest, precomputed by host).
-	// Prepend 32 zero bytes as a placeholder; the root does not affect execution cost.
-	var root [32]byte
-	payload = append(root[:], payload...)
-
-	// ziskemu-0.16.1 requires the payload size to be a multiple of 8.
-	for len(payload)%8 != 0 {
-		payload = append(payload, 0)
-	}
-
-	// Ziskemu file framing: [u64 LE: len][bytes]
 	var out bytes.Buffer
 	var lenBuf [8]byte
-	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(payload)))
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(contentLen))
 	out.Write(lenBuf[:])
 	out.Write(payload)
-	return out.Bytes(), nil
-}
-
-// encodeZesuRLP serialises blockRLP + witness + pubKeys into the zevm-stateless
-// big-endian length-prefixed binary format.
-func encodeZesuRLP(blockRLP []byte, w WitnessData, pubKeys [][]byte) ([]byte, error) {
-	var buf bytes.Buffer
-
-	writeU64BE(&buf, uint64(len(blockRLP)))
-	buf.Write(blockRLP)
-
-	for _, arr := range [][]string{w.State, w.Codes, w.Keys} {
-		decoded, err := decodeHexArray(arr)
-		if err != nil {
-			return nil, err
-		}
-		writeArray(&buf, decoded)
-	}
-	headers, err := decodeHexArray(w.Headers)
-	if err != nil {
-		return nil, fmt.Errorf("headers: %w", err)
-	}
-	writeArray(&buf, headers)
-
-	// Pre-recovered public keys: 64 bytes each (uncompressed, no 0x04 prefix).
-	// Sender = keccak256(pubkey)[12:], avoiding ECRECOVER in the guest.
-	writeArray(&buf, pubKeys)
-
-	return buf.Bytes(), nil
-}
-
-// BlockRLP re-encodes a fixture block as Ethereum block RLP:
-// RLP([header, txs_list, ommers_list, withdrawals_list])
-func BlockRLP(b FixtureBlock) ([]byte, error) {
-	data, _, err := blockRLPAndTxs(b)
-	return data, err
-}
-
-// blockRLPAndTxs returns the block RLP together with the decoded transaction
-// objects so callers can recover sender public keys without re-parsing.
-func blockRLPAndTxs(b FixtureBlock) ([]byte, types.Transactions, error) {
-	header, err := buildHeader(b.Header)
-	if err != nil {
-		return nil, nil, fmt.Errorf("header: %w", err)
-	}
-	txs, err := buildTransactions(b.Body.Transactions)
-	if err != nil {
-		return nil, nil, fmt.Errorf("transactions: %w", err)
-	}
-	withdrawals, err := buildWithdrawals(b.Body.Withdrawals)
-	if err != nil {
-		return nil, nil, fmt.Errorf("withdrawals: %w", err)
-	}
-
-	type extblock struct {
-		Header      *types.Header
-		Txs         types.Transactions
-		Uncles      []*types.Header
-		Withdrawals []*types.Withdrawal `rlp:"optional"`
-	}
-	data, err := rlp.EncodeToBytes(&extblock{
-		Header:      header,
-		Txs:         txs,
-		Uncles:      nil,
-		Withdrawals: withdrawals,
-	})
-	return data, txs, err
-}
-
-// recoverPublicKeys recovers the 64-byte uncompressed secp256k1 public key
-// (no 0x04 prefix) for every transaction in the block. The chain ID is inferred
-// from the first typed transaction; legacy-only blocks default to mainnet (1).
-func recoverPublicKeys(txs types.Transactions) ([][]byte, error) {
-	if len(txs) == 0 {
-		return nil, nil
-	}
-	chainID := big.NewInt(1)
-	for _, tx := range txs {
-		if cid := tx.ChainId(); cid != nil && cid.Sign() > 0 {
-			chainID = cid
-			break
-		}
-	}
-	signer := types.LatestSignerForChainID(chainID)
-	keys := make([][]byte, len(txs))
-	for i, tx := range txs {
-		pub, err := recoverTxPublicKey(signer, tx)
-		if err != nil {
-			return nil, fmt.Errorf("tx[%d]: %w", i, err)
-		}
-		keys[i] = pub
-	}
-	return keys, nil
-}
-
-// recoverTxPublicKey returns the 64-byte uncompressed public key for tx.
-func recoverTxPublicKey(signer types.Signer, tx *types.Transaction) ([]byte, error) {
-	v, r, s := tx.RawSignatureValues()
-
-	sig := make([]byte, 65)
-	r.FillBytes(sig[0:32])
-	s.FillBytes(sig[32:64])
-
-	var hash common.Hash
-	switch tx.Type() {
-	case types.LegacyTxType:
-		// V < 35 means pre-EIP-155 (V = 27 + yParity).
-		// V >= 35 means EIP-155 (V = chainID*2 + 35 + yParity).
-		// We derive chain ID directly from V rather than using the block-level
-		// signer, which would fail for pre-155 txs in a block that also has typed txs.
-		if v.Cmp(big.NewInt(35)) < 0 {
-			hash = types.HomesteadSigner{}.Hash(tx)
-			sig[64] = byte(new(big.Int).Sub(v, big.NewInt(27)).Uint64())
-		} else {
-			txChainID := new(big.Int).Rsh(new(big.Int).Sub(v, big.NewInt(35)), 1)
-			hash = types.NewEIP155Signer(txChainID).Hash(tx)
-			yp := new(big.Int).Sub(v, new(big.Int).Add(
-				new(big.Int).Mul(txChainID, big.NewInt(2)),
-				big.NewInt(35),
-			))
-			sig[64] = byte(yp.Uint64())
-		}
-	default:
-		hash = signer.Hash(tx)
-		sig[64] = byte(v.Uint64())
-	}
-
-	full, err := crypto.Ecrecover(hash.Bytes(), sig)
-	if err != nil {
-		return nil, err
-	}
-	return full[1:], nil // strip 0x04 prefix → 64 bytes
-}
-
-// buildHeader converts the fixture snake_case header to a go-ethereum Header.
-func buildHeader(h FixtureHeader) (*types.Header, error) {
-	difficulty, err := hexToBigInt(h.Difficulty)
-	if err != nil {
-		return nil, fmt.Errorf("difficulty: %w", err)
-	}
-	nonce, err := hexToBlockNonce(h.Nonce)
-	if err != nil {
-		return nil, fmt.Errorf("nonce: %w", err)
-	}
-	baseFee, err := rawJSONToBigInt(h.BaseFeePerGas)
-	if err != nil {
-		return nil, fmt.Errorf("base_fee_per_gas: %w", err)
-	}
-
-	hdr := &types.Header{
-		ParentHash:  hexToHash(h.ParentHash),
-		UncleHash:   hexToHash(h.OmmersHash),
-		Coinbase:    hexToAddress(h.Beneficiary),
-		Root:        hexToHash(h.StateRoot),
-		TxHash:      hexToHash(h.TransactionsRoot),
-		ReceiptHash: hexToHash(h.ReceiptsRoot),
-		Bloom:       hexToBloom(h.LogsBloom),
-		Difficulty:  difficulty,
-		Number:      new(big.Int).SetUint64(h.Number),
-		GasLimit:    h.GasLimit,
-		GasUsed:     h.GasUsed,
-		Time:        h.Timestamp,
-		Extra:       mustHexToBytes(h.ExtraData),
-		MixDigest:   hexToHash(h.MixHash),
-		Nonce:       nonce,
-		BaseFee:     baseFee,
-	}
-	if h.WithdrawalsRoot != nil {
-		wh := hexToHash(*h.WithdrawalsRoot)
-		hdr.WithdrawalsHash = &wh
-	}
-	if h.BlobGasUsed != nil {
-		v := *h.BlobGasUsed
-		hdr.BlobGasUsed = &v
-	}
-	if h.ExcessBlobGas != nil {
-		v := *h.ExcessBlobGas
-		hdr.ExcessBlobGas = &v
-	}
-	if h.ParentBeaconBlockRoot != nil {
-		pbr := hexToHash(*h.ParentBeaconBlockRoot)
-		hdr.ParentBeaconRoot = &pbr
-	}
-	if h.RequestsHash != nil {
-		rh := hexToHash(*h.RequestsHash)
-		hdr.RequestsHash = &rh
-	}
-	return hdr, nil
+	return out.Bytes(), expectedSuccess, nil
 }
 
 func buildTransactions(txs []FixtureTx) (types.Transactions, error) {
@@ -573,45 +358,16 @@ func decodeAccessList(raw json.RawMessage) (types.AccessList, error) {
 	return al, nil
 }
 
-// --- Binary encoding helpers ---
-
-func writeU64BE(buf *bytes.Buffer, v uint64) {
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], v)
-	buf.Write(b[:])
-}
-
-func writeArray(buf *bytes.Buffer, items [][]byte) {
-	writeU64BE(buf, uint64(len(items)))
-	for _, item := range items {
-		writeU64BE(buf, uint64(len(item)))
-		buf.Write(item)
-	}
-}
-
 // --- Type conversion helpers ---
 
-func hexToHash(s string) common.Hash          { return common.HexToHash(s) }
-func hexToAddress(s string) common.Address    { return common.HexToAddress(s) }
+func hexToHash(s string) common.Hash       { return common.HexToHash(s) }
+func hexToAddress(s string) common.Address { return common.HexToAddress(s) }
 
 func hexToBloom(s string) types.Bloom {
 	b := mustHexToBytes(s)
 	var bloom types.Bloom
 	copy(bloom[:], b)
 	return bloom
-}
-
-func hexToBlockNonce(s string) (types.BlockNonce, error) {
-	b, err := hexStrToBytes(s)
-	if err != nil {
-		return types.BlockNonce{}, err
-	}
-	var nonce types.BlockNonce
-	if len(b) > 8 {
-		return types.BlockNonce{}, fmt.Errorf("nonce too long: %d bytes", len(b))
-	}
-	copy(nonce[8-len(b):], b)
-	return nonce, nil
 }
 
 func hexToBigInt(s string) (*big.Int, error) {

@@ -39,13 +39,15 @@ type CostReport struct {
 
 // BlockResult holds the outcome of running one fixture block.
 type BlockResult struct {
-	BlockNum  uint64
-	Name      string
-	Costs     CostReport
-	Err       error
-	ErrOutput string // raw ziskemu output when Err != nil
-	ExecError string // non-empty when ziskemu ran but EVM execution failed (e.g. "InvalidGasUsed")
-	Elapsed   time.Duration
+	BlockNum        uint64
+	Name            string
+	Costs           CostReport
+	Err             error
+	ErrOutput       string // raw ziskemu output when Err != nil
+	ExecError       string // non-empty when ziskemu ran but EVM execution failed (e.g. "InvalidGasUsed")
+	Elapsed         time.Duration
+	ExpectedSuccess bool
+	ValidationOK    bool // true when execution outcome matches fixture expectation
 }
 
 var blockNumRe = regexp.MustCompile(`block_(\d+)`)
@@ -53,7 +55,7 @@ var blockNumRe = regexp.MustCompile(`block_(\d+)`)
 func main() {
 	fixturesDir := flag.String("fixtures", "", "directory containing fixture JSON files (required)")
 	elfPath := flag.String("elf", "", "path to the zesu-zkvm ELF binary (required)")
-	ziskemuPath := flag.String("ziskemu", "ziskemu-0.16.1", "path to ziskemu binary")
+	ziskemuPath := flag.String("ziskemu", "ziskemu", "path to ziskemu binary (zisk-0.17+)")
 	jobs := flag.Int("jobs", 1, "number of parallel ziskemu runs")
 	reportPath := flag.String("report", "bench_report.html", "output HTML report path")
 	flag.Parse()
@@ -90,42 +92,55 @@ func main() {
 			name := strings.TrimSuffix(filepath.Base(path), ".json")
 			blockNum := extractBlockNum(name)
 			t := time.Now()
-			costs, execErr, errOut, runErr := benchOne(path, *elfPath, *ziskemuPath)
+			costs, execErr, errOut, runErr, expectedSuccess := benchOne(path, *elfPath, *ziskemuPath)
 			elapsed := time.Since(t)
+			gotSuccess := runErr == nil && execErr == ""
+			validationOK := runErr == nil && gotSuccess == expectedSuccess
 			n := done.Add(1)
 			if runErr != nil {
 				fmt.Printf("[%3d/%d] ERROR %-40s  %v\n", n, len(paths), name, runErr)
+			} else if !validationOK {
+				fmt.Printf("[%3d/%d] block %d  total=%d  VALIDATION FAILED (expected success=%v)  (%s)\n", n, len(paths), blockNum, costs.Total, expectedSuccess, elapsed.Round(time.Millisecond))
 			} else if execErr != "" {
-				fmt.Printf("[%3d/%d] block %d  total=%d  EXEC FAILED: %s  (%s)\n", n, len(paths), blockNum, costs.Total, execErr, elapsed.Round(time.Millisecond))
+				fmt.Printf("[%3d/%d] block %d  total=%d  EXEC FAILED (expected): %s  (%s)\n", n, len(paths), blockNum, costs.Total, execErr, elapsed.Round(time.Millisecond))
 			} else {
 				fmt.Printf("[%3d/%d] block %d  total=%d  (%s)\n", n, len(paths), blockNum, costs.Total, elapsed.Round(time.Millisecond))
 			}
 			results[idx] = BlockResult{
-				BlockNum:  blockNum,
-				Name:      name,
-				Costs:     costs,
-				Err:       runErr,
-				ErrOutput: errOut,
-				ExecError: execErr,
-				Elapsed:   elapsed,
+				BlockNum:        blockNum,
+				Name:            name,
+				Costs:           costs,
+				Err:             runErr,
+				ErrOutput:       errOut,
+				ExecError:       execErr,
+				Elapsed:         elapsed,
+				ExpectedSuccess: expectedSuccess,
+				ValidationOK:    validationOK,
 			}
 		}(i, p)
 	}
 	wg.Wait()
 
-	// Collect successful results sorted by block number.
+	// Collect results: good = ziskemu ran OK; validated = good + outcome matches fixture.
 	var good []BlockResult
+	var validationFailures []BlockResult
 	for _, r := range results {
 		if r.Err == nil {
 			good = append(good, r)
+			if !r.ValidationOK {
+				validationFailures = append(validationFailures, r)
+			}
 		}
 	}
 	sort.Slice(good, func(i, j int) bool { return good[i].BlockNum < good[j].BlockNum })
 
 	if len(good) > 0 {
-		printSummary(good, len(results))
+		printSummary(good, len(results), len(validationFailures))
 	} else {
 		log.Printf("WARNING: no successful results — report will contain errors only")
+	}
+	if len(validationFailures) > 0 {
+		log.Printf("VALIDATION FAILURES: %d block(s) had unexpected execution outcome", len(validationFailures))
 	}
 
 	if err := writeReport(*reportPath, good, results); err != nil {
@@ -134,46 +149,47 @@ func main() {
 	log.Printf("report written to %s", *reportPath)
 }
 
-// benchOne returns (costs, execError, rawOutput, error). execError is non-empty
-// when ziskemu ran successfully but the EVM execution itself failed (success=0).
-// rawOutput is always populated from ziskemu's combined output.
-func benchOne(fixturePath, elfPath, ziskemuPath string) (CostReport, string, string, error) {
+// benchOne returns (costs, execError, rawOutput, error, expectedSuccess).
+// execError is non-empty when ziskemu ran successfully but the EVM execution
+// itself failed (success=0). rawOutput is always populated from ziskemu's
+// combined output. expectedSuccess reflects the fixture's Success field.
+func benchOne(fixturePath, elfPath, ziskemuPath string) (CostReport, string, string, error, bool) {
 	f, err := fixture.LoadFile(fixturePath)
 	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("load: %w", err)
+		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false
 	}
 
-	input, err := fixture.ZesuInput(f)
+	input, err := fixture.ZesuInputSSZ(f)
 	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("encode: %w", err)
+		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success
 	}
 
 	tmp, err := os.CreateTemp("", "zesu-bench-*.bin")
 	if err != nil {
-		return CostReport{}, "", "", err
+		return CostReport{}, "", "", err, f.Success
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(input); err != nil {
 		tmp.Close()
-		return CostReport{}, "", "", err
+		return CostReport{}, "", "", err, f.Success
 	}
 	if err := tmp.Close(); err != nil {
-		return CostReport{}, "", "", err
+		return CostReport{}, "", "", err, f.Success
 	}
 
 	out, err := exec.Command(ziskemuPath, "-X", "-e", elfPath, "-i", tmp.Name()).
 		CombinedOutput()
 	rawOut := strings.TrimSpace(string(out))
 	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("ziskemu: %w", err)
+		return CostReport{}, "", rawOut, fmt.Errorf("ziskemu: %w", err), f.Success
 	}
 
 	costs, ok := parseCostReport(rawOut)
 	if !ok {
-		return CostReport{}, "", rawOut, fmt.Errorf("no COST DISTRIBUTION in ziskemu output")
+		return CostReport{}, "", rawOut, fmt.Errorf("no COST DISTRIBUTION in ziskemu output"), f.Success
 	}
 	execErr := parseExecError(rawOut)
-	return costs, execErr, rawOut, nil
+	return costs, execErr, rawOut, nil, f.Success
 }
 
 var execFailedRe = regexp.MustCompile(`error: execution failed: (\S+)`)
@@ -271,7 +287,7 @@ func computeStats(vals []uint64) costStats {
 	}
 }
 
-func printSummary(good []BlockResult, total int) {
+func printSummary(good []BlockResult, total, validationFailures int) {
 	extract := func(fn func(CostReport) uint64) []uint64 {
 		vs := make([]uint64, len(good))
 		for i, r := range good {
@@ -279,7 +295,8 @@ func printSummary(good []BlockResult, total int) {
 		}
 		return vs
 	}
-	fmt.Printf("\n=== Results (%d/%d blocks) ===\n", len(good), total)
+	validated := len(good) - validationFailures
+	fmt.Printf("\n=== Results (%d/%d blocks, %d/%d validated) ===\n", len(good), total, validated, len(good))
 	fmt.Printf("%-14s %18s %18s %18s %18s\n", "COMPONENT", "MIN", "P50", "MAX", "AVG")
 	fmt.Printf("%s\n", strings.Repeat("-", 92))
 	for _, row := range []struct {
@@ -301,26 +318,35 @@ func printSummary(good []BlockResult, total int) {
 // ── HTML report ───────────────────────────────────────────────────────────────
 
 type reportData struct {
-	Generated   string
-	Total       int
-	Good        int
-	Failed      int
-	StatRows    []statRow
-	Labels      template.JS // JSON array of block numbers
-	TotalCosts  template.JS
-	BaseCosts   template.JS
-	MainCosts   template.JS
-	OpCosts     template.JS
-	PreCosts    template.JS
-	MemCosts    template.JS
-	ExecFailed  []execFailedRow
-	Errors      []errorRow
+	Generated        string
+	Total            int
+	Good             int
+	Failed           int
+	ValidationFailed int
+	StatRows         []statRow
+	Labels           template.JS // JSON array of block numbers
+	TotalCosts       template.JS
+	BaseCosts        template.JS
+	MainCosts        template.JS
+	OpCosts          template.JS
+	PreCosts         template.JS
+	MemCosts         template.JS
+	ExecFailed       []execFailedRow
+	ValidationFails  []validationFailRow
+	Errors           []errorRow
 }
 
 type execFailedRow struct {
 	BlockNum uint64
 	Name     string
 	Reason   string
+}
+
+type validationFailRow struct {
+	BlockNum        uint64
+	Name            string
+	ExpectedSuccess bool
+	ExecError       string // non-empty when execution failed
 }
 
 type errorRow struct {
@@ -389,16 +415,26 @@ func writeReport(path string, good []BlockResult, all []BlockResult) error {
 	}
 
 	var execFailedRows []execFailedRow
+	var validationFailRows []validationFailRow
 	for _, r := range all {
-		if r.Err == nil && r.ExecError != "" {
+		if r.Err == nil && r.ExecError != "" && r.ValidationOK {
 			execFailedRows = append(execFailedRows, execFailedRow{
 				BlockNum: r.BlockNum,
 				Name:     r.Name,
 				Reason:   r.ExecError,
 			})
 		}
+		if r.Err == nil && !r.ValidationOK {
+			validationFailRows = append(validationFailRows, validationFailRow{
+				BlockNum:        r.BlockNum,
+				Name:            r.Name,
+				ExpectedSuccess: r.ExpectedSuccess,
+				ExecError:       r.ExecError,
+			})
+		}
 	}
 	sort.Slice(execFailedRows, func(i, j int) bool { return execFailedRows[i].BlockNum < execFailedRows[j].BlockNum })
+	sort.Slice(validationFailRows, func(i, j int) bool { return validationFailRows[i].BlockNum < validationFailRows[j].BlockNum })
 
 	var errRows []errorRow
 	for _, r := range all {
@@ -414,20 +450,22 @@ func writeReport(path string, good []BlockResult, all []BlockResult) error {
 	sort.Slice(errRows, func(i, j int) bool { return errRows[i].BlockNum < errRows[j].BlockNum })
 
 	data := reportData{
-		Generated:  time.Now().Format(time.RFC1123),
-		Total:      total,
-		Good:       len(good),
-		Failed:     len(execFailedRows),
-		StatRows:   statRows,
-		Labels:     toJS(blockNums),
-		TotalCosts: toJS(extract(func(c CostReport) uint64 { return c.Total })),
-		BaseCosts:  toJS(extract(func(c CostReport) uint64 { return c.Base })),
-		MainCosts:  toJS(extract(func(c CostReport) uint64 { return c.Main })),
-		OpCosts:    toJS(extract(func(c CostReport) uint64 { return c.Opcodes })),
-		PreCosts:   toJS(extract(func(c CostReport) uint64 { return c.Precompiles })),
-		MemCosts:   toJS(extract(func(c CostReport) uint64 { return c.Memory })),
-		ExecFailed: execFailedRows,
-		Errors:     errRows,
+		Generated:        time.Now().Format(time.RFC1123),
+		Total:            total,
+		Good:             len(good),
+		Failed:           len(execFailedRows),
+		ValidationFailed: len(validationFailRows),
+		StatRows:         statRows,
+		Labels:           toJS(blockNums),
+		TotalCosts:       toJS(extract(func(c CostReport) uint64 { return c.Total })),
+		BaseCosts:        toJS(extract(func(c CostReport) uint64 { return c.Base })),
+		MainCosts:        toJS(extract(func(c CostReport) uint64 { return c.Main })),
+		OpCosts:          toJS(extract(func(c CostReport) uint64 { return c.Opcodes })),
+		PreCosts:         toJS(extract(func(c CostReport) uint64 { return c.Precompiles })),
+		MemCosts:         toJS(extract(func(c CostReport) uint64 { return c.Memory })),
+		ExecFailed:       execFailedRows,
+		ValidationFails:  validationFailRows,
+		Errors:           errRows,
 	}
 
 	f, err := os.Create(path)
@@ -466,7 +504,7 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 </head>
 <body>
 <h1>zesu-zkvm Benchmark Report</h1>
-<p class="meta">Generated: {{.Generated}} &nbsp;|&nbsp; Blocks: {{.Good}}/{{.Total}} succeeded{{if .Failed}} &nbsp;|&nbsp; <span style="color:#dc3545">{{.Failed}} execution failure(s)</span>{{end}}</p>
+<p class="meta">Generated: {{.Generated}} &nbsp;|&nbsp; Blocks: {{.Good}}/{{.Total}} succeeded{{if .ValidationFailed}} &nbsp;|&nbsp; <span style="color:#dc3545">{{.ValidationFailed}} validation failure(s)</span>{{end}}{{if .Failed}} &nbsp;|&nbsp; {{.Failed}} expected failure(s){{end}}</p>
 
 <h2>Cost Summary</h2>
 <table>
@@ -490,15 +528,31 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 <h2>Cost Breakdown by Block</h2>
 <div class="chart-wrap"><canvas id="stackedChart"></canvas></div>
 
+{{if .ValidationFails}}
+<h2>Validation Failures ({{len .ValidationFails}} blocks)</h2>
+<table id="validationFailTable">
+  <thead><tr><th>Block</th><th>Expected</th><th>Got</th></tr></thead>
+  <tbody>
+  {{range .ValidationFails}}
+  <tr>
+    <td style="white-space:nowrap;font-family:monospace">{{.BlockNum}}</td>
+    <td>{{if .ExpectedSuccess}}success{{else}}failure{{end}}</td>
+    <td style="color:#dc3545">{{if .ExecError}}failed: {{.ExecError}}{{else}}success{{end}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
 {{if .ExecFailed}}
-<h2>Execution Failures ({{len .ExecFailed}} blocks)</h2>
+<h2>Expected Failures ({{len .ExecFailed}} blocks)</h2>
 <table id="execFailTable">
   <thead><tr><th>Block</th><th>Reason</th></tr></thead>
   <tbody>
   {{range .ExecFailed}}
   <tr>
     <td style="white-space:nowrap;font-family:monospace">{{.BlockNum}}</td>
-    <td style="font-family:monospace;color:#dc3545">{{.Reason}}</td>
+    <td style="font-family:monospace;color:#6c757d">{{.Reason}}</td>
   </tr>
   {{end}}
   </tbody>
