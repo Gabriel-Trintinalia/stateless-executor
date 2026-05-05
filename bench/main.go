@@ -159,7 +159,7 @@ func benchOne(fixturePath, elfPath, ziskemuPath string) (CostReport, string, str
 		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false
 	}
 
-	input, err := fixture.ZesuInputSSZ(f)
+	input, err := fixture.ZesuInputBinary(f)
 	if err != nil {
 		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success
 	}
