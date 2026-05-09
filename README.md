@@ -135,20 +135,19 @@ go build -o bin/zkevm-runner ./cmd/zkevm-runner
 Reads one JSON block fixture and writes a zkVM-ready SSZ binary input to a file (or stdout).
 
 ```
-zesu-convert [--ziskinput | --openvm-input] <fixture.json> [output.bin]
+zesu-convert [--zkvm-input] <fixture.json> [output.bin]
 zesu-convert <fixture.json> > output.bin
 ```
 
 | Flag | Description |
 |---|---|
 | *(none)* | Raw SSZ body with no framing (for inspection / native zesu) |
-| `--ziskinput` | 8-byte LE length header + 8-byte alignment padding (ZisK format) |
-| `--openvm-input` | Same framing as `--ziskinput` (ZisK and OpenVM formats are identical) |
+| `--zkvm-input` | 8-byte LE length header + 8-byte alignment padding (required by all zkVM targets) |
 
 **Example — ZisK**
 
 ```bash
-./bin/zesu-convert --ziskinput rpc_block_24758569.json block_24758569.bin
+./bin/zesu-convert --zkvm-input rpc_block_24758569.json block_24758569.bin
 # stderr: ok: <N> bytes, block=24758569 txns=156
 
 ziskemu -X -e zesu-zisk -i block_24758569.bin
@@ -157,9 +156,11 @@ ziskemu -X -e zesu-zisk -i block_24758569.bin
 **Example — OpenVM**
 
 ```bash
-./bin/zesu-convert --openvm-input rpc_block_24758569.json block_24758569.bin
+./bin/zesu-convert --zkvm-input rpc_block_24758569.json block_24758569.bin
 
-zesu-openvm-runner zesu-openvm.elf block_24758569.bin -o out.bin
+~/dev/stateless/zesu-zkvm/openvm/runner/target/release/zesu-openvm-runner \
+  -e ~/dev/stateless/zesu-zkvm/openvm/zig-out/bin/zesu-openvm \
+  -i block_24758569.bin -o out.bin
 xxd out.bin   # [0..32] new_payload_request_root, [32] success, [33..41] chain_id LE
 ```
 
@@ -180,7 +181,7 @@ Transactions, the SSZ container layout, and pre-computed values are derived from
 Runs a directory of JSON fixtures through a zkVM emulator in parallel and produces a terminal summary plus an interactive HTML report. Supports both ZisK and OpenVM targets.
 
 ```
-bench --fixtures <dir> --elf <path> [--target zisk|openvm] [--ziskemu <path>] [--runner <path>] [--jobs N] [--report <path>]
+bench --fixtures <dir> --elf <path> [--target zisk|openvm] [--zkvmPath <path>] [--jobs N] [--report <path>]
 ```
 
 | Flag | Default | Description |
@@ -188,10 +189,11 @@ bench --fixtures <dir> --elf <path> [--target zisk|openvm] [--ziskemu <path>] [-
 | `--fixtures` | *(required)* | Directory containing `*.json` fixture files, or a single file |
 | `--elf` | *(required)* | Path to the compiled zkVM ELF binary |
 | `--target` | `zisk` | zkVM target: `zisk` or `openvm` |
-| `--ziskemu` | `ziskemu` | Path to the ziskemu binary (`zisk-0.17+`; used when `--target zisk`) |
-| `--runner` | `zesu-openvm-runner` | Path to the OpenVM runner binary (used when `--target openvm`) |
+| `--zkvmPath` | `ziskemu` / `zesu-openvm-runner` | Path to the zkVM emulator binary (default chosen from `--target`) |
 | `--jobs` | `1` | Number of parallel emulator runs |
 | `--report` | `bench_report.html` | Output path for the HTML report |
+
+Both targets are invoked as `<zkvmPath> -X -e <elf> -i <input.bin>` (OpenVM runner additionally receives `-o <output.bin>`).
 
 **Example — ZisK**
 
@@ -209,8 +211,8 @@ bench --fixtures <dir> --elf <path> [--target zisk|openvm] [--ziskemu <path>] [-
 ./bin/bench \
   --target openvm \
   --fixtures ~/blocks_500_mainnet_Q12026 \
-  --elf ~/dev/zesu-zkvm/openvm/zig-out/bin/zesu-openvm \
-  --runner ~/dev/zesu-zkvm/openvm/runner/target/release/zesu-openvm-runner \
+  --elf ~/dev/stateless/zesu-zkvm/openvm/zig-out/bin/zesu-openvm \
+  --zkvmPath ~/dev/stateless/zesu-zkvm/openvm/runner/target/release/zesu-openvm-runner \
   --jobs 2 \
   --report bench_openvm.html
 ```

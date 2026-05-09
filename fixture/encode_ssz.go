@@ -101,13 +101,7 @@ func ZesuInputSSZPlain(f *FixtureFile) ([]byte, error) {
 	return encodeSszStatelessInput(f, txs, withdrawals, parentBeaconRoot)
 }
 
-// ZesuInputOpenVM encodes a fixture as an openvm-runner-ready input.
-// The wire format is identical to ZesuInputSSZ: [8-byte LE payload_len][padded SSZ body].
-func ZesuInputOpenVM(f *FixtureFile) ([]byte, error) {
-	return ZesuInputSSZ(f)
-}
-
-// ZesuInputSSZ encodes a fixture as a ziskemu-ready input using the SSZ path.
+// ZesuInputSSZ encodes a fixture as a zkvm-ready input using the SSZ path.
 // No 32-byte root prefix — zesu-zkvm computes new_payload_request_root internally.
 func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
 	payload, err := ZesuInputSSZPlain(f)

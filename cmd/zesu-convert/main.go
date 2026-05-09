@@ -1,6 +1,6 @@
 // zesu-convert: read one fixture JSON, write zesu-zkvm binary input to stdout or a file.
 //
-//	zesu-convert [--ziskinput | --openvm-input] <fixture.json> [output.bin]
+//	zesu-convert [--zkvm-input] <fixture.json> [output.bin]
 //	zesu-convert <fixture.json> > output.bin
 package main
 
@@ -13,10 +13,9 @@ import (
 )
 
 func main() {
-	ziskInput := flag.Bool("ziskinput", false, "wrap output with 8-byte length header and alignment padding (zisk format)")
-	openVMInput := flag.Bool("openvm-input", false, "wrap output for openvm runner (identical format to --ziskinput)")
+	zkvmInput := flag.Bool("zkvm-input", false, "wrap output with 8-byte length header and alignment padding (required for all zkVM targets)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: zesu-convert [--ziskinput | --openvm-input] <fixture.json> [output.bin]\n")
+		fmt.Fprintf(os.Stderr, "usage: zesu-convert [--zkvm-input] <fixture.json> [output.bin]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -34,12 +33,9 @@ func main() {
 	}
 
 	var data []byte
-	switch {
-	case *ziskInput:
+	if *zkvmInput {
 		data, err = fixture.ZesuInputSSZ(f)
-	case *openVMInput:
-		data, err = fixture.ZesuInputOpenVM(f)
-	default:
+	} else {
 		data, err = fixture.ZesuInputSSZPlain(f)
 	}
 	if err != nil {

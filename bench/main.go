@@ -27,14 +27,17 @@ import (
 	"github.com/Gabriel-Trintinalia/stateless-executor/fixture"
 )
 
-// CostReport holds the parsed ziskemu COST DISTRIBUTION table for one block.
+// CostReport holds the parsed COST DISTRIBUTION table for one block.
+// ZisK populates Base/Main/Opcodes/Precompiles/Memory/Total (circuit trace cells).
+// OpenVM populates Instructions/Total (retired instruction count).
 type CostReport struct {
-	Base        uint64
-	Main        uint64
-	Opcodes     uint64
-	Precompiles uint64
-	Memory      uint64
-	Total       uint64
+	Base         uint64
+	Main         uint64
+	Opcodes      uint64
+	Precompiles  uint64
+	Memory       uint64
+	Total        uint64
+	Instructions uint64 // OpenVM: retired instruction count (deterministic)
 }
 
 // BlockResult holds the outcome of running one fixture block.
@@ -57,8 +60,7 @@ func main() {
 	fixturesDir := flag.String("fixtures", "", "directory containing fixture JSON files (required)")
 	elfPath := flag.String("elf", "", "path to the zesu-zkvm ELF binary (required)")
 	targetFlag := flag.String("target", "zisk", "zkVM target: zisk or openvm")
-	ziskemuPath := flag.String("ziskemu", "ziskemu", "path to ziskemu binary (zisk-0.17+)")
-	runnerPath := flag.String("runner", "zesu-openvm-runner", "path to openvm runner binary")
+	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM)")
 	jobs := flag.Int("jobs", 1, "number of parallel emulator runs")
 	reportPath := flag.String("report", "bench_report.html", "output HTML report path")
 	flag.Parse()
@@ -69,6 +71,13 @@ func main() {
 	}
 	if *targetFlag != "zisk" && *targetFlag != "openvm" {
 		log.Fatalf("unknown target %q: must be zisk or openvm", *targetFlag)
+	}
+	if *zkvmPath == "" {
+		if *targetFlag == "openvm" {
+			*zkvmPath = "zesu-openvm-runner"
+		} else {
+			*zkvmPath = "ziskemu"
+		}
 	}
 	if _, err := os.Stat(*elfPath); err != nil {
 		log.Fatalf("ELF not found at %s: %v", *elfPath, err)
@@ -81,16 +90,16 @@ func main() {
 	if len(paths) == 0 {
 		log.Fatalf("no JSON fixtures found in %s", *fixturesDir)
 	}
-	log.Printf("found %d fixtures, running with %s (%d job(s))...", len(paths), *targetFlag, *jobs)
+	log.Printf("found %d fixtures, running with %s/%s (%d job(s))...", len(paths), *targetFlag, *zkvmPath, *jobs)
 
 	var runBench func(fixturePath string) (CostReport, string, string, error, bool)
 	if *targetFlag == "openvm" {
-		ep, rp := *elfPath, *runnerPath
+		ep, zp := *elfPath, *zkvmPath
 		runBench = func(p string) (CostReport, string, string, error, bool) {
-			return benchOneOpenVM(p, ep, rp)
+			return benchOneOpenVM(p, ep, zp)
 		}
 	} else {
-		ep, zp := *elfPath, *ziskemuPath
+		ep, zp := *elfPath, *zkvmPath
 		runBench = func(p string) (CostReport, string, string, error, bool) {
 			return benchOne(p, ep, zp)
 		}
@@ -181,7 +190,7 @@ func main() {
 }
 
 // benchOne returns (costs, execError, rawOutput, error, expectedSuccess) for a ZisK run.
-func benchOne(fixturePath, elfPath, ziskemuPath string) (CostReport, string, string, error, bool) {
+func benchOne(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool) {
 	f, err := fixture.LoadFile(fixturePath)
 	if err != nil {
 		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false
@@ -205,7 +214,7 @@ func benchOne(fixturePath, elfPath, ziskemuPath string) (CostReport, string, str
 		return CostReport{}, "", "", err, f.Success
 	}
 
-	out, err := exec.Command(ziskemuPath, "-X", "-e", elfPath, "-i", tmp.Name()).
+	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmp.Name()).
 		CombinedOutput()
 	rawOut := strings.TrimSpace(string(out))
 	if err != nil {
@@ -223,13 +232,13 @@ func benchOne(fixturePath, elfPath, ziskemuPath string) (CostReport, string, str
 // benchOneOpenVM returns (costs, execError, rawOutput, error, expectedSuccess) for an OpenVM run.
 // costs is always zero — OpenVM emulation does not produce a circuit cost breakdown.
 // execError is "ExecutionFailed" when the guest writes success=0 to public values byte[32].
-func benchOneOpenVM(fixturePath, elfPath, runnerPath string) (CostReport, string, string, error, bool) {
+func benchOneOpenVM(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool) {
 	f, err := fixture.LoadFile(fixturePath)
 	if err != nil {
 		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false
 	}
 
-	input, err := fixture.ZesuInputOpenVM(f)
+	input, err := fixture.ZesuInputSSZ(f)
 	if err != nil {
 		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success
 	}
@@ -255,7 +264,7 @@ func benchOneOpenVM(fixturePath, elfPath, runnerPath string) (CostReport, string
 	tmpOut.Close()
 	defer os.Remove(tmpOutPath)
 
-	out, err := exec.Command(runnerPath, elfPath, tmpIn.Name(), "-o", tmpOutPath).
+	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmpIn.Name(), "-o", tmpOutPath).
 		CombinedOutput()
 	rawOut := strings.TrimSpace(string(out))
 	if err != nil {
@@ -274,7 +283,8 @@ func benchOneOpenVM(fixturePath, elfPath, runnerPath string) (CostReport, string
 	if outBytes[32] == 0 {
 		execErr = "ExecutionFailed"
 	}
-	return CostReport{}, execErr, rawOut, nil, f.Success
+	costs, _ := parseCostReport(rawOut)
+	return costs, execErr, rawOut, nil, f.Success
 }
 
 var execFailedRe = regexp.MustCompile(`error: execution failed: (\S+)`)
@@ -287,7 +297,9 @@ func parseExecError(output string) string {
 	return m[1]
 }
 
-// parseCostReport parses the ziskemu COST DISTRIBUTION table.
+// parseCostReport parses a COST DISTRIBUTION table from combined runner output.
+// Handles both ZisK (BASE/MAIN/OPCODES/PRECOMPILES/MEMORY/TOTAL) and
+// OpenVM (ELAPSED_MS/TOTAL) table formats.
 func parseCostReport(output string) (CostReport, bool) {
 	var r CostReport
 	sc := bufio.NewScanner(strings.NewReader(output))
@@ -305,6 +317,9 @@ func parseCostReport(output string) (CostReport, bool) {
 			r.Precompiles = v
 		} else if v, ok := parseCostLine(line, "MEMORY"); ok {
 			r.Memory = v
+		} else if v, ok := parseCostLine(line, "INSTRUCTIONS"); ok {
+			r.Instructions = v
+			found = true
 		} else if v, ok := parseCostLine(line, "TOTAL"); ok {
 			r.Total = v
 		}
@@ -366,14 +381,14 @@ func printSummary(good []BlockResult, total, validationFailures int, target stri
 	fmt.Printf("\n=== Results (%d/%d blocks, %d/%d validated) ===\n", len(good), total, validated, len(good))
 
 	if target == "openvm" {
-		elapsedMs := make([]uint64, len(good))
+		insns := make([]uint64, len(good))
 		for i, r := range good {
-			elapsedMs[i] = uint64(r.Elapsed.Milliseconds())
+			insns[i] = r.Costs.Instructions
 		}
-		s := computeStats(elapsedMs)
-		fmt.Printf("%-14s %18s %18s %18s %18s\n", "ELAPSED (ms)", "MIN", "P50", "MAX", "AVG")
+		s := computeStats(insns)
+		fmt.Printf("%-14s %18s %18s %18s %18s\n", "INSTRUCTIONS", "MIN", "P50", "MAX", "AVG")
 		fmt.Printf("%s\n", strings.Repeat("-", 92))
-		fmt.Printf("%-14s %18d %18d %18d %18d\n", "ELAPSED", s.Min, s.P50, s.Max, s.Avg)
+		fmt.Printf("%-14s %18d %18d %18d %18d\n", "INSTRUCTIONS", s.Min, s.P50, s.Max, s.Avg)
 		return
 	}
 
@@ -413,7 +428,8 @@ type reportData struct {
 	ValidationFailed int
 	StatRows         []statRow
 	Labels           template.JS
-	ElapsedMs        template.JS // ms per block (both targets)
+	ElapsedMs         template.JS // outer wall-clock ms per block (both targets)
+	InstructionCounts template.JS // retired instruction count per block (OpenVM only)
 	TotalCosts       template.JS // ZisK only
 	BaseCosts        template.JS
 	MainCosts        template.JS
@@ -471,9 +487,11 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 
 	blockNums := make([]uint64, len(good))
 	elapsedMs := make([]uint64, len(good))
+	instructionCounts := make([]uint64, len(good))
 	for i, r := range good {
 		blockNums[i] = r.BlockNum
 		elapsedMs[i] = uint64(r.Elapsed.Milliseconds())
+		instructionCounts[i] = r.Costs.Instructions
 	}
 
 	extract := func(fn func(CostReport) uint64) []uint64 {
@@ -486,8 +504,12 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 
 	var statRows []statRow
 	if target == "openvm" {
-		s := computeStats(elapsedMs)
-		statRows = []statRow{{Label: "ELAPSED (ms)", Min: s.Min, P50: s.P50, Max: s.Max, Avg: s.Avg}}
+		insns := make([]uint64, len(good))
+		for i, r := range good {
+			insns[i] = r.Costs.Instructions
+		}
+		s := computeStats(insns)
+		statRows = []statRow{{Label: "INSTRUCTIONS", Min: s.Min, P50: s.P50, Max: s.Max, Avg: s.Avg}}
 	} else {
 		for _, row := range []struct {
 			label string
@@ -554,8 +576,9 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		Failed:           len(execFailedRows),
 		ValidationFailed: len(validationFailRows),
 		StatRows:         statRows,
-		Labels:           toJS(blockNums),
-		ElapsedMs:        toJS(elapsedMs),
+		Labels:            toJS(blockNums),
+		ElapsedMs:         toJS(elapsedMs),
+		InstructionCounts: toJS(instructionCounts),
 		TotalCosts:       toJS(extract(func(c CostReport) uint64 { return c.Total })),
 		BaseCosts:        toJS(extract(func(c CostReport) uint64 { return c.Base })),
 		MainCosts:        toJS(extract(func(c CostReport) uint64 { return c.Main })),
@@ -623,7 +646,12 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   </tbody>
 </table>
 
-<h2>Elapsed Time by Block (ms)</h2>
+{{if eq .Target "openvm"}}
+<h2>Instruction Count by Block</h2>
+<div class="chart-wrap"><canvas id="instructionChart"></canvas></div>
+{{end}}
+
+<h2>Wall-Clock Time by Block (ms)</h2>
 <div class="chart-wrap"><canvas id="elapsedChart"></canvas></div>
 
 {{if eq .Target "zisk"}}
@@ -686,14 +714,42 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 {{end}}
 
 <script>
-const labels     = {{.Labels}};
-const elapsedMs  = {{.ElapsedMs}};
-const totalCosts = {{.TotalCosts}};
+const labels             = {{.Labels}};
+const elapsedMs          = {{.ElapsedMs}};
+const instructionCounts  = {{.InstructionCounts}};
+const totalCosts         = {{.TotalCosts}};
 const baseCosts  = {{.BaseCosts}};
 const mainCosts  = {{.MainCosts}};
 const opCosts    = {{.OpCosts}};
 const preCosts   = {{.PreCosts}};
 const memCosts   = {{.MemCosts}};
+
+{{if eq .Target "openvm"}}
+new Chart(document.getElementById('instructionChart'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [{
+      label: 'Instructions',
+      data: instructionCounts,
+      borderColor: '#0d6efd',
+      backgroundColor: 'rgba(13,110,253,0.08)',
+      borderWidth: 1.5,
+      pointRadius: 2,
+      fill: true,
+      tension: 0.2,
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { title: { display: true, text: 'Block Number' } },
+      y: { title: { display: true, text: 'Retired Instructions' }, beginAtZero: true }
+    }
+  }
+});
+{{end}}
 
 new Chart(document.getElementById('elapsedChart'), {
   type: 'line',
