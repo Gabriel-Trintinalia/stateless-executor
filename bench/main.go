@@ -218,7 +218,7 @@ func benchOne(fixturePath, elfPath, zkvmPath string) (CostReport, string, string
 		CombinedOutput()
 	rawOut := strings.TrimSpace(string(out))
 	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("ziskemu: %w", err), f.Success
+		return CostReport{}, "", rawOut, fmt.Errorf("zkvm: %w", err), f.Success
 	}
 
 	costs, ok := parseCostReport(rawOut)
