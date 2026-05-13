@@ -133,6 +133,8 @@ func main() {
 				gotSuccess, gotOutputHex, rawOut, runErr = runOne(it.tc, it.block, *elfPath, *ziskemuPath)
 			}
 			elapsed := time.Since(t)
+			// Engine-API-layer expectation, kept only for the report's informational
+			// "Expected" column — not consulted for the pass/fail decision below.
 			expectedSuccess := it.block.ExpectException == ""
 			expectedOutputHex := strings.ToLower(strings.TrimPrefix(it.block.StatelessOutputBytes, "0x"))
 			// ziskemu's -o writes the full output region (zero-padded), so trim got to expected's length.
@@ -141,18 +143,21 @@ func main() {
 				gotOutputCmp = gotOutputCmp[:len(expectedOutputHex)]
 			}
 			outputMatch := expectedOutputHex == "" || gotOutputCmp == expectedOutputHex
-			validationOK := *dumpDir != "" || (runErr == nil && gotSuccess == expectedSuccess && outputMatch)
+			// SSZ-output match is the authoritative pass/fail signal. We do NOT
+			// consult ExpectException: for fixtures built with Block.rlp_modifier
+			// the corruption only exists in the RLP block, while statelessInputBytes
+			// (and statelessOutputBytes) still describe the canonical pre-modifier
+			// block — so a spec-compliant guest correctly returns successful_validation
+			// for those inputs even though ExpectException is set. See the EELS
+			// fixture-format issue for the full story.
+			validationOK := *dumpDir != "" || (runErr == nil && outputMatch)
 
 			n := done.Add(1)
 			status := "OK"
 			if runErr != nil {
 				status = fmt.Sprintf("ERROR: %v", runErr)
 			} else if !validationOK {
-				if gotSuccess != expectedSuccess {
-					status = fmt.Sprintf("VALIDATION FAILED (expected success=%v got=%v)", expectedSuccess, gotSuccess)
-				} else {
-					status = "VALIDATION FAILED (output mismatch)"
-				}
+				status = "VALIDATION FAILED (output mismatch)"
 			}
 			fmt.Printf("[%3d/%d] %s  [%s]  %s  (%s)\n",
 				n, len(items), truncateName(it.name), it.network, status, elapsed.Round(time.Millisecond))
