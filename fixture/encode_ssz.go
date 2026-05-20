@@ -1,85 +1,71 @@
 package fixture
 
-// SSZ encoder for SszStatelessInput (Amsterdam stateless spec).
+// SSZ encoder for SszStatelessInput (bal-devnet-7 / zkevm@v0.4.1).
 //
 // Implements the container layout from stateless_ssz.py, matched to what
-// zesu's ssz.zig decoder expects. Key divergence from spec:
+// zesu's ssz.zig decoder expects. Key divergences from spec:
 //   - SszWithdrawal.amount encoded as uint64 (8 bytes), not uint256 (32 bytes)
 //   - base_fee_per_gas encoded as uint256 (32 bytes LE); zesu reads low 8 bytes only
 //
-// SszStatelessInput fixed region (20 bytes):
-//   [0..4]   offset → new_payload_request
-//   [4..8]   offset → witness
-//   [8..16]  chain_config.chain_id (uint64 LE)
-//   [16..20] offset → public_keys
+// Stateless input bytes layout (v0.4.1):
+//   [0..2]    schema_id (big-endian uint16, fixed at 0x0001)
+//   --- SszStatelessInput container ---
+//   [0..4]    offset → new_payload_request   (variable)
+//   [4..8]    offset → witness               (variable)
+//   [8..12]   offset → chain_config          (variable; SszChainConfig)
+//   [12..16]  offset → public_keys           (variable; packed ByteVector[65])
+//
+// SszChainConfig embeds the full active fork descriptor (fork enum,
+// activation timestamps, blob schedule). For mainnet/Amsterdam the body is
+// a 68-byte constant (sszChainConfigAmsterdamMainnet) — the only target of
+// the v0.4.1 zkevm fixtures.
 //
 // SszExecutionPayload fixed region (540 bytes): see encodeSszExecutionPayload.
 
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// injectForkName takes raw statelessInputBytes (hex) and rebuilds the SSZ with a 24-byte
-// fixed region that adds fork_name as a 5th variable field. Without this, test fixtures
-// with synthetic timestamps (e.g. 1000) resolve to Frontier via mainnetSpec.
+// statelessInputSchemaID is the 2-byte big-endian prefix on every
+// bal-devnet-7 / zkevm@v0.4.1 stateless input. See STATELESS_INPUT_SCHEMA_ID
+// in stateless_ssz.py.
+const statelessInputSchemaID = uint16(0x0001)
+
+// sszChainConfigAmsterdamMainnet is the SSZ-encoded body of SszChainConfig
+// for mainnet at Amsterdam — { chain_id: 1, active_fork: { fork: Amsterdam,
+// activation: { block_number: [], timestamp: [0] }, blob_schedule: [{
+// target: 14, max: 21, base_fee_update_fraction: 0xB24B3F }] } }.
 //
-// Original layout (off_npr == 20):
-//   [0..4] off_npr [4..8] off_witness [8..16] chain_id [16..20] off_pubkeys
-//
-// Extended layout (off_npr == 24):
-//   [0..4] off_npr [4..8] off_witness [8..16] chain_id [16..20] off_pubkeys [20..24] off_fork_name
-//
-// Returns (padded_payload, content_len). The ziskemu input_len header must be set to
-// content_len (not len(padded_payload)) so that fork_name_bytes = data[off_fork_name..content_len]
-// contains exactly the fork name with no trailing padding zeros.
-func injectForkName(statelessInputHex string, forkName string) ([]byte, int, error) {
-	ssz, err := hexStrToBytes(statelessInputHex)
-	if err != nil {
-		return nil, 0, fmt.Errorf("decode hex: %w", err)
-	}
-	if len(ssz) < 20 {
-		return nil, 0, fmt.Errorf("SSZ too short (%d bytes)", len(ssz))
-	}
-
-	offNPR := binary.LittleEndian.Uint32(ssz[0:4])
-	if offNPR != 20 {
-		// Already extended or unknown format — return as-is.
-		contentLen := len(ssz)
-		for len(ssz)%8 != 0 {
-			ssz = append(ssz, 0)
-		}
-		return ssz, contentLen, nil
-	}
-
-	// All variable-field offsets shift by 4 (fixed region grows 20→24).
-	offWitness := binary.LittleEndian.Uint32(ssz[4:8]) + 4
-	chainID := binary.LittleEndian.Uint64(ssz[8:16])
-	offPubkeys := binary.LittleEndian.Uint32(ssz[16:20]) + 4
-
-	varData := ssz[20:] // NPR + Witness + PubKeys
-	forkNameBytes := []byte(forkName)
-	offForkName := uint32(24) + uint32(len(varData)) // fork_name comes after all existing variable data
-
-	var hdr bytes.Buffer
-	writeU32LE(&hdr, 24) // off_npr — marks extended format
-	writeU32LE(&hdr, offWitness)
-	binary.Write(&hdr, binary.LittleEndian, chainID)
-	writeU32LE(&hdr, offPubkeys)
-	writeU32LE(&hdr, offForkName)
-
-	content := append(hdr.Bytes(), varData...)
-	content = append(content, forkNameBytes...)
-	contentLen := len(content)
-	for len(content)%8 != 0 {
-		content = append(content, 0)
-	}
-	return content, contentLen, nil
+// The constant matches the trailer hardcoded by zesu's ssz_output.zig.
+// 68 bytes total (offsets relative to start of chain_config).
+var sszChainConfigAmsterdamMainnet = [68]byte{
+	// chain_id = 1 (uint64 LE)
+	0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	// offset → active_fork (= 12)
+	0x0c, 0x00, 0x00, 0x00,
+	// active_fork.fork = 24 (Amsterdam ProtocolFork enum, uint64 LE)
+	0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	// offset → activation (= 16, within active_fork)
+	0x10, 0x00, 0x00, 0x00,
+	// offset → blob_schedule (= 32, within active_fork)
+	0x20, 0x00, 0x00, 0x00,
+	// activation.block_number — offset 8 (empty optional list)
+	0x08, 0x00, 0x00, 0x00,
+	// activation.timestamp — offset 8 (1-element optional list)
+	0x08, 0x00, 0x00, 0x00,
+	// activation.timestamp[0] = 0 (uint64 LE)
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	// blob_schedule[0].target = 14 (uint64 LE)
+	0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	// blob_schedule[0].max = 21 (uint64 LE)
+	0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	// blob_schedule[0].base_fee_update_fraction = 0xB24B3F (uint64 LE)
+	0x3f, 0x4b, 0xb2, 0x00, 0x00, 0x00, 0x00, 0x00,
 }
 
 // ZesuInputSSZ encodes a fixture as a ziskemu-ready input using the SSZ path.
@@ -120,7 +106,20 @@ func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// encodeSszStatelessInput serialises SszStatelessInput.
+// encodeSszStatelessInput serialises SszStatelessInput (v0.4.1).
+//
+// Layout:
+//   [0..2]   schema_id (big-endian 0x0001) — outside the container
+//   --- SszStatelessInput container (all 4 fields variable) ---
+//   [0..4]   offset → new_payload_request
+//   [4..8]   offset → witness
+//   [8..12]  offset → chain_config
+//   [12..16] offset → public_keys
+//   [16..]   variable section, in order: npr, witness, chain_config, public_keys
+//
+// public_keys is SszList[ByteVector[65], MAX_PUBLIC_KEYS] — fixed-size 65-byte
+// elements packed back-to-back. We always emit zero public keys (no pre-
+// recovered signatures on the offline SSZ path) → 0 bytes.
 func encodeSszStatelessInput(f *FixtureFile, txs types.Transactions, withdrawals []*types.Withdrawal, parentBeaconRoot common.Hash) ([]byte, error) {
 	npr, err := encodeSszNewPayloadRequest(f, txs, withdrawals, parentBeaconRoot)
 	if err != nil {
@@ -130,17 +129,31 @@ func encodeSszStatelessInput(f *FixtureFile, txs types.Transactions, withdrawals
 	if err != nil {
 		return nil, err
 	}
-	pubKeys := encodeSszByteListList(nil) // no pre-recovered keys on SSZ path
+	chainCfg := sszChainConfigAmsterdamMainnet[:]
+	var pubKeys []byte // empty packed ByteVector[65] list
 
-	// Fixed region: 4 (npr offset) + 4 (wit offset) + 8 (chain_id) + 4 (pk offset) = 20
-	const fixedSize = 20
-	var fix bytes.Buffer
-	writeU32LE(&fix, uint32(fixedSize))
-	writeU32LE(&fix, uint32(fixedSize+len(npr)))
-	binary.Write(&fix, binary.LittleEndian, uint64(1)) // chain_id = 1 (mainnet)
-	writeU32LE(&fix, uint32(fixedSize+len(npr)+len(wit)))
+	// Fixed region: four uint32 offsets = 16 bytes.
+	const fixedSize = 16
+	offNPR := uint32(fixedSize)
+	offWitness := offNPR + uint32(len(npr))
+	offChainCfg := offWitness + uint32(len(wit))
+	offPubKeys := offChainCfg + uint32(len(chainCfg))
 
-	return append(fix.Bytes(), append(npr, append(wit, pubKeys...)...)...), nil
+	var out bytes.Buffer
+	// Schema-id prefix (big-endian uint16).
+	var sid [2]byte
+	binary.BigEndian.PutUint16(sid[:], statelessInputSchemaID)
+	out.Write(sid[:])
+	// Container body.
+	writeU32LE(&out, offNPR)
+	writeU32LE(&out, offWitness)
+	writeU32LE(&out, offChainCfg)
+	writeU32LE(&out, offPubKeys)
+	out.Write(npr)
+	out.Write(wit)
+	out.Write(chainCfg)
+	out.Write(pubKeys)
+	return out.Bytes(), nil
 }
 
 // encodeSszNewPayloadRequest serialises SszNewPayloadRequest.
