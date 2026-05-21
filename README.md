@@ -132,20 +132,36 @@ go build -o bin/zkevm-runner ./cmd/zkevm-runner
 
 ### `zesu-convert` — fixture to binary
 
-Reads one JSON block fixture and writes the ziskemu-ready SSZ binary input to a file (or stdout).
+Reads one JSON block fixture and writes a zkVM-ready SSZ binary input to a file (or stdout).
 
 ```
-zesu-convert <fixture.json> [output.bin]
+zesu-convert [--zkvm-input] <fixture.json> [output.bin]
 zesu-convert <fixture.json> > output.bin
 ```
 
-**Example**
+| Flag | Description |
+|---|---|
+| *(none)* | Raw SSZ body with no framing (for inspection / native zesu) |
+| `--zkvm-input` | 8-byte LE length header + 8-byte alignment padding (required by all zkVM targets) |
+
+**Example — ZisK**
 
 ```bash
-./bin/zesu-convert rpc_block_24758569.json block_24758569.bin
+./bin/zesu-convert --zkvm-input rpc_block_24758569.json block_24758569.bin
 # stderr: ok: <N> bytes, block=24758569 txns=156
 
 ziskemu -X -e zesu-zisk -i block_24758569.bin
+```
+
+**Example — OpenVM**
+
+```bash
+./bin/zesu-convert --zkvm-input rpc_block_24758569.json block_24758569.bin
+
+~/dev/stateless/zesu-zkvm/openvm/runner/target/release/zesu-openvm-runner \
+  -e ~/dev/stateless/zesu-zkvm/openvm/zig-out/bin/zesu-openvm \
+  -i block_24758569.bin -o out.bin
+xxd out.bin   # [0..32] new_payload_request_root, [32] success, [33..41] chain_id LE
 ```
 
 **Output format**
@@ -162,51 +178,76 @@ Transactions, the SSZ container layout, and pre-computed values are derived from
 
 ### `bench` — batch benchmark runner
 
-Runs a directory of JSON fixtures through ziskemu in parallel and produces a terminal summary plus an interactive HTML report.
+Runs a directory of JSON fixtures through a zkVM emulator in parallel and produces a terminal summary plus an interactive HTML report. Supports both ZisK and OpenVM targets.
 
 ```
-bench --fixtures <dir> --elf <path> [--ziskemu <path>] [--jobs N] [--report <path>]
+bench --fixtures <dir> --elf <path> [--target zisk|openvm] [--zkvmPath <path>] [--jobs N] [--report <path>]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--fixtures` | *(required)* | Directory containing `*.json` fixture files, or a single file |
-| `--elf` | *(required)* | Path to the compiled `zesu-zisk` ELF binary |
-| `--ziskemu` | `ziskemu` | Path to the ziskemu emulator binary (zisk-0.17+; `ziskup --cpu` puts it on PATH) |
-| `--jobs` | `1` | Number of parallel ziskemu runs |
+| `--elf` | *(required)* | Path to the compiled zkVM ELF binary |
+| `--target` | `zisk` | zkVM target: `zisk` or `openvm` |
+| `--zkvmPath` | `ziskemu` / `zesu-openvm-runner` | Path to the zkVM emulator binary (default chosen from `--target`) |
+| `--jobs` | `1` | Number of parallel emulator runs |
 | `--report` | `bench_report.html` | Output path for the HTML report |
 
-**Example**
+Both targets are invoked as `<zkvmPath> -X -e <elf> -i <input.bin>` (OpenVM runner additionally receives `-o <output.bin>`).
+
+**Example — ZisK**
 
 ```bash
 ./bin/bench \
   --fixtures ~/blocks_500_mainnet_Q12026 \
   --elf ~/dev/zesu-zkvm/zisk/zig-out/bin/zesu-zisk \
   --jobs 4 \
-  --report bench_report.html
+  --report bench_zisk.html
 ```
 
-**Terminal output** (one line per block as it completes, then a summary table):
+**Example — OpenVM**
 
+```bash
+./bin/bench \
+  --target openvm \
+  --fixtures ~/blocks_500_mainnet_Q12026 \
+  --elf ~/dev/stateless/zesu-zkvm/openvm/zig-out/bin/zesu-openvm \
+  --zkvmPath ~/dev/stateless/zesu-zkvm/openvm/runner/target/release/zesu-openvm-runner \
+  --jobs 2 \
+  --report bench_openvm.html
+```
+
+**Terminal output** (one line per block, then a summary):
+
+ZisK:
 ```
 [  1/500] block 24758569  total=34217493280  (12.4s)
-[  2/500] block 24758570  total=1842938100   (1.1s)
-...
 
-=== Results (500/500 blocks) ===
+=== Results (500/500 blocks, 500/500 validated) ===
 COMPONENT               MIN                P50                MAX                AVG
 --------------------------------------------------------------------------------------------
-BASE             293601280         293601280         293601280         293601280
-MAIN              12345678          98765432         432109876         134567890
-OPCODES            1234567          12345678          98765432          23456789
-PRECOMPILES              0           1234567          23456789           2345678
-MEMORY             1234567           3456789          12345678           4567890
-TOTAL            308016092         409403756        860313275         458836527
+BASE             293601280         ...
+TOTAL            308016092         ...
+```
+
+OpenVM:
+```
+[  1/500] block 24758569  (3.2s)
+
+=== Results (500/500 blocks, 500/500 validated) ===
+ELAPSED (ms)            MIN                P50                MAX                AVG
+--------------------------------------------------------------------------------------------
+ELAPSED               1200               3200               9800               3400
 ```
 
 **HTML report**
 
-Opens in any browser. Contains the cost summary table, a line chart of total cost by block number, and a stacked bar chart breaking down BASE / MAIN / OPCODES / PRECOMPILES / MEMORY per block. Blocks that errored are listed in a collapsible table with the raw ziskemu output.
+Opens in any browser. The target is shown as a badge in the report header.
+
+- **ZisK**: circuit cost summary table, total-cost line chart, and stacked breakdown (BASE / MAIN / OPCODES / PRECOMPILES / MEMORY) per block.
+- **OpenVM**: elapsed-time line chart per block (no circuit cost breakdown — OpenVM emulation does not emit one).
+
+Both targets include validation-failure and error tables.
 
 ---
 

@@ -247,7 +247,7 @@ func runOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, elfPath, ziske
 		CombinedOutput()
 	rawOut := strings.TrimSpace(string(cmd))
 	if err != nil {
-		return false, "", rawOut, fmt.Errorf("ziskemu: %w", err)
+		return false, "", rawOut, fmt.Errorf("zkvm: %w", err)
 	}
 
 	// success=1 in the zesu UART log means EVM execution succeeded.
