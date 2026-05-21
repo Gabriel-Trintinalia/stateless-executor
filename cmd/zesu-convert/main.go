@@ -1,10 +1,11 @@
 // zesu-convert: read one fixture JSON, write zesu-zkvm binary input to stdout or a file.
 //
-//	zesu-convert <fixture.json> [output.bin]
+//	zesu-convert [--zkvm-input] <fixture.json> [output.bin]
 //	zesu-convert <fixture.json> > output.bin
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -12,26 +13,39 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: zesu-convert <fixture.json> [output.bin]\n")
+	zkvmInput := flag.Bool("zkvm-input", false, "wrap output with 8-byte length header and alignment padding (required for all zkVM targets)")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: zesu-convert [--zkvm-input] <fixture.json> [output.bin]\n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 1 {
+		flag.Usage()
 		os.Exit(1)
 	}
 
-	f, err := fixture.LoadFile(os.Args[1])
+	f, err := fixture.LoadFile(args[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load: %v\n", err)
 		os.Exit(1)
 	}
 
-	data, err := fixture.ZesuInputSSZ(f)
+	var data []byte
+	if *zkvmInput {
+		data, err = fixture.ZesuInputSSZ(f)
+	} else {
+		data, err = fixture.ZesuInputSSZPlain(f)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "encode: %v\n", err)
 		os.Exit(1)
 	}
 
 	out := os.Stdout
-	if len(os.Args) >= 3 {
-		out, err = os.Create(os.Args[2])
+	if len(args) >= 2 {
+		out, err = os.Create(args[1])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "create output: %v\n", err)
 			os.Exit(1)

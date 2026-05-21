@@ -68,9 +68,8 @@ var sszChainConfigAmsterdamMainnet = [68]byte{
 	0x3f, 0x4b, 0xb2, 0x00, 0x00, 0x00, 0x00, 0x00,
 }
 
-// ZesuInputSSZ encodes a fixture as a ziskemu-ready input using the SSZ path.
-// No 32-byte root prefix — zesu-zkvm computes new_payload_request_root internally.
-func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
+// ZesuInputSSZPlain encodes a fixture as a plain SSZ blob with no zisk framing.
+func ZesuInputSSZPlain(f *FixtureFile) ([]byte, error) {
 	txs, err := buildTransactions(f.StatelessInput.Block.Body.Transactions)
 	if err != nil {
 		return nil, err
@@ -85,7 +84,13 @@ func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
 		parentBeaconRoot = hexToHash(*f.StatelessInput.Block.Header.ParentBeaconBlockRoot)
 	}
 
-	payload, err := encodeSszStatelessInput(f, txs, withdrawals, parentBeaconRoot)
+	return encodeSszStatelessInput(f, txs, withdrawals, parentBeaconRoot)
+}
+
+// ZesuInputSSZ encodes a fixture as a zkvm-ready input using the SSZ path.
+// No 32-byte root prefix — zesu-zkvm computes new_payload_request_root internally.
+func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
+	payload, err := ZesuInputSSZPlain(f)
 	if err != nil {
 		return nil, err
 	}

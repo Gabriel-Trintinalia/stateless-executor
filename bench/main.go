@@ -1,10 +1,10 @@
 // Command bench converts fixture JSON files to zesu-zkvm binary inputs and
-// runs each one through ziskemu, reporting cost statistics and generating an
-// HTML report with charts.
+// runs each one through a zkVM emulator, reporting statistics and generating
+// an HTML report.
 //
 // Usage:
 //
-//	bench --fixtures <dir> --elf <path> [--ziskemu <path>] [--jobs N] [--report <path>]
+//	bench --fixtures <dir> --elf <path> [--target zisk|openvm] [--ziskemu <path>] [--runner <path>] [--jobs N] [--report <path>]
 package main
 
 import (
@@ -27,27 +27,31 @@ import (
 	"github.com/Gabriel-Trintinalia/stateless-executor/fixture"
 )
 
-// CostReport holds the parsed ziskemu COST DISTRIBUTION table for one block.
+// CostReport holds the parsed COST DISTRIBUTION table for one block.
+// ZisK populates Base/Main/Opcodes/Precompiles/Memory/Total (circuit trace cells).
+// OpenVM populates Instructions/Total (retired instruction count).
 type CostReport struct {
-	Base       uint64
-	Main       uint64
-	Opcodes    uint64
-	Precompiles uint64
-	Memory     uint64
-	Total      uint64
+	Base         uint64
+	Main         uint64
+	Opcodes      uint64
+	Precompiles  uint64
+	Memory       uint64
+	Total        uint64
+	Instructions uint64 // OpenVM: retired instruction count (deterministic)
 }
 
 // BlockResult holds the outcome of running one fixture block.
 type BlockResult struct {
 	BlockNum        uint64
 	Name            string
+	Target          string // "zisk" or "openvm"
 	Costs           CostReport
 	Err             error
-	ErrOutput       string // raw ziskemu output when Err != nil
-	ExecError       string // non-empty when ziskemu ran but EVM execution failed (e.g. "InvalidGasUsed")
+	ErrOutput       string
+	ExecError       string
 	Elapsed         time.Duration
 	ExpectedSuccess bool
-	ValidationOK    bool // true when execution outcome matches fixture expectation
+	ValidationOK    bool
 }
 
 var blockNumRe = regexp.MustCompile(`block_(\d+)`)
@@ -55,14 +59,25 @@ var blockNumRe = regexp.MustCompile(`block_(\d+)`)
 func main() {
 	fixturesDir := flag.String("fixtures", "", "directory containing fixture JSON files (required)")
 	elfPath := flag.String("elf", "", "path to the zesu-zkvm ELF binary (required)")
-	ziskemuPath := flag.String("ziskemu", "ziskemu", "path to ziskemu binary (zisk-0.17+)")
-	jobs := flag.Int("jobs", 1, "number of parallel ziskemu runs")
+	targetFlag := flag.String("target", "zisk", "zkVM target: zisk or openvm")
+	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM)")
+	jobs := flag.Int("jobs", 1, "number of parallel emulator runs")
 	reportPath := flag.String("report", "bench_report.html", "output HTML report path")
 	flag.Parse()
 
 	if *fixturesDir == "" || *elfPath == "" {
 		flag.Usage()
 		os.Exit(1)
+	}
+	if *targetFlag != "zisk" && *targetFlag != "openvm" {
+		log.Fatalf("unknown target %q: must be zisk or openvm", *targetFlag)
+	}
+	if *zkvmPath == "" {
+		if *targetFlag == "openvm" {
+			*zkvmPath = "zesu-openvm-runner"
+		} else {
+			*zkvmPath = "ziskemu"
+		}
 	}
 	if _, err := os.Stat(*elfPath); err != nil {
 		log.Fatalf("ELF not found at %s: %v", *elfPath, err)
@@ -75,7 +90,20 @@ func main() {
 	if len(paths) == 0 {
 		log.Fatalf("no JSON fixtures found in %s", *fixturesDir)
 	}
-	log.Printf("found %d fixtures, running with ziskemu (%d job(s))...", len(paths), *jobs)
+	log.Printf("found %d fixtures, running with %s/%s (%d job(s))...", len(paths), *targetFlag, *zkvmPath, *jobs)
+
+	var runBench func(fixturePath string) (CostReport, string, string, error, bool)
+	if *targetFlag == "openvm" {
+		ep, zp := *elfPath, *zkvmPath
+		runBench = func(p string) (CostReport, string, string, error, bool) {
+			return benchOneOpenVM(p, ep, zp)
+		}
+	} else {
+		ep, zp := *elfPath, *zkvmPath
+		runBench = func(p string) (CostReport, string, string, error, bool) {
+			return benchOne(p, ep, zp)
+		}
+	}
 
 	results := make([]BlockResult, len(paths))
 	sem := make(chan struct{}, *jobs)
@@ -92,7 +120,7 @@ func main() {
 			name := strings.TrimSuffix(filepath.Base(path), ".json")
 			blockNum := extractBlockNum(name)
 			t := time.Now()
-			costs, execErr, errOut, runErr, expectedSuccess := benchOne(path, *elfPath, *ziskemuPath)
+			costs, execErr, errOut, runErr, expectedSuccess := runBench(path)
 			elapsed := time.Since(t)
 			gotSuccess := runErr == nil && execErr == ""
 			validationOK := runErr == nil && gotSuccess == expectedSuccess
@@ -100,15 +128,28 @@ func main() {
 			if runErr != nil {
 				fmt.Printf("[%3d/%d] ERROR %-40s  %v\n", n, len(paths), name, runErr)
 			} else if !validationOK {
-				fmt.Printf("[%3d/%d] block %d  total=%d  VALIDATION FAILED (expected success=%v)  (%s)\n", n, len(paths), blockNum, costs.Total, expectedSuccess, elapsed.Round(time.Millisecond))
+				if *targetFlag == "openvm" {
+					fmt.Printf("[%3d/%d] block %d  VALIDATION FAILED (expected success=%v)  (%s)\n", n, len(paths), blockNum, expectedSuccess, elapsed.Round(time.Millisecond))
+				} else {
+					fmt.Printf("[%3d/%d] block %d  total=%d  VALIDATION FAILED (expected success=%v)  (%s)\n", n, len(paths), blockNum, costs.Total, expectedSuccess, elapsed.Round(time.Millisecond))
+				}
 			} else if execErr != "" {
-				fmt.Printf("[%3d/%d] block %d  total=%d  EXEC FAILED (expected): %s  (%s)\n", n, len(paths), blockNum, costs.Total, execErr, elapsed.Round(time.Millisecond))
+				if *targetFlag == "openvm" {
+					fmt.Printf("[%3d/%d] block %d  EXEC FAILED (expected): %s  (%s)\n", n, len(paths), blockNum, execErr, elapsed.Round(time.Millisecond))
+				} else {
+					fmt.Printf("[%3d/%d] block %d  total=%d  EXEC FAILED (expected): %s  (%s)\n", n, len(paths), blockNum, costs.Total, execErr, elapsed.Round(time.Millisecond))
+				}
 			} else {
-				fmt.Printf("[%3d/%d] block %d  total=%d  (%s)\n", n, len(paths), blockNum, costs.Total, elapsed.Round(time.Millisecond))
+				if *targetFlag == "openvm" {
+					fmt.Printf("[%3d/%d] block %d  (%s)\n", n, len(paths), blockNum, elapsed.Round(time.Millisecond))
+				} else {
+					fmt.Printf("[%3d/%d] block %d  total=%d  (%s)\n", n, len(paths), blockNum, costs.Total, elapsed.Round(time.Millisecond))
+				}
 			}
 			results[idx] = BlockResult{
 				BlockNum:        blockNum,
 				Name:            name,
+				Target:          *targetFlag,
 				Costs:           costs,
 				Err:             runErr,
 				ErrOutput:       errOut,
@@ -121,7 +162,6 @@ func main() {
 	}
 	wg.Wait()
 
-	// Collect results: good = ziskemu ran OK; validated = good + outcome matches fixture.
 	var good []BlockResult
 	var validationFailures []BlockResult
 	for _, r := range results {
@@ -135,7 +175,7 @@ func main() {
 	sort.Slice(good, func(i, j int) bool { return good[i].BlockNum < good[j].BlockNum })
 
 	if len(good) > 0 {
-		printSummary(good, len(results), len(validationFailures))
+		printSummary(good, len(results), len(validationFailures), *targetFlag)
 	} else {
 		log.Printf("WARNING: no successful results — report will contain errors only")
 	}
@@ -143,17 +183,14 @@ func main() {
 		log.Printf("VALIDATION FAILURES: %d block(s) had unexpected execution outcome", len(validationFailures))
 	}
 
-	if err := writeReport(*reportPath, good, results); err != nil {
+	if err := writeReport(*reportPath, good, results, *targetFlag); err != nil {
 		log.Fatalf("write report: %v", err)
 	}
 	log.Printf("report written to %s", *reportPath)
 }
 
-// benchOne returns (costs, execError, rawOutput, error, expectedSuccess).
-// execError is non-empty when ziskemu ran successfully but the EVM execution
-// itself failed (success=0). rawOutput is always populated from ziskemu's
-// combined output. expectedSuccess reflects the fixture's Success field.
-func benchOne(fixturePath, elfPath, ziskemuPath string) (CostReport, string, string, error, bool) {
+// benchOne returns (costs, execError, rawOutput, error, expectedSuccess) for a ZisK run.
+func benchOne(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool) {
 	f, err := fixture.LoadFile(fixturePath)
 	if err != nil {
 		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false
@@ -177,11 +214,11 @@ func benchOne(fixturePath, elfPath, ziskemuPath string) (CostReport, string, str
 		return CostReport{}, "", "", err, f.Success
 	}
 
-	out, err := exec.Command(ziskemuPath, "-X", "-e", elfPath, "-i", tmp.Name()).
+	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmp.Name()).
 		CombinedOutput()
 	rawOut := strings.TrimSpace(string(out))
 	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("ziskemu: %w", err), f.Success
+		return CostReport{}, "", rawOut, fmt.Errorf("zkvm: %w", err), f.Success
 	}
 
 	costs, ok := parseCostReport(rawOut)
@@ -192,10 +229,66 @@ func benchOne(fixturePath, elfPath, ziskemuPath string) (CostReport, string, str
 	return costs, execErr, rawOut, nil, f.Success
 }
 
+// benchOneOpenVM returns (costs, execError, rawOutput, error, expectedSuccess) for an OpenVM run.
+// costs is always zero — OpenVM emulation does not produce a circuit cost breakdown.
+// execError is "ExecutionFailed" when the guest writes success=0 to public values byte[32].
+func benchOneOpenVM(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool) {
+	f, err := fixture.LoadFile(fixturePath)
+	if err != nil {
+		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false
+	}
+
+	input, err := fixture.ZesuInputSSZ(f)
+	if err != nil {
+		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success
+	}
+
+	tmpIn, err := os.CreateTemp("", "zesu-bench-in-*.bin")
+	if err != nil {
+		return CostReport{}, "", "", err, f.Success
+	}
+	defer os.Remove(tmpIn.Name())
+	if _, err := tmpIn.Write(input); err != nil {
+		tmpIn.Close()
+		return CostReport{}, "", "", err, f.Success
+	}
+	if err := tmpIn.Close(); err != nil {
+		return CostReport{}, "", "", err, f.Success
+	}
+
+	tmpOut, err := os.CreateTemp("", "zesu-bench-out-*.bin")
+	if err != nil {
+		return CostReport{}, "", "", err, f.Success
+	}
+	tmpOutPath := tmpOut.Name()
+	tmpOut.Close()
+	defer os.Remove(tmpOutPath)
+
+	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmpIn.Name(), "-o", tmpOutPath).
+		CombinedOutput()
+	rawOut := strings.TrimSpace(string(out))
+	if err != nil {
+		return CostReport{}, "", rawOut, fmt.Errorf("runner: %w", err), f.Success
+	}
+
+	outBytes, err := os.ReadFile(tmpOutPath)
+	if err != nil {
+		return CostReport{}, "", rawOut, fmt.Errorf("read output: %w", err), f.Success
+	}
+	if len(outBytes) < 41 {
+		return CostReport{}, "", rawOut, fmt.Errorf("output too short: %d bytes (expected 41)", len(outBytes)), f.Success
+	}
+
+	execErr := ""
+	if outBytes[32] == 0 {
+		execErr = "ExecutionFailed"
+	}
+	costs, _ := parseCostReport(rawOut)
+	return costs, execErr, rawOut, nil, f.Success
+}
+
 var execFailedRe = regexp.MustCompile(`error: execution failed: (\S+)`)
 
-// parseExecError returns the failure reason from a line like
-// "error: execution failed: InvalidGasUsed", or "" if not found.
 func parseExecError(output string) string {
 	m := execFailedRe.FindStringSubmatch(output)
 	if len(m) < 2 {
@@ -204,14 +297,9 @@ func parseExecError(output string) string {
 	return m[1]
 }
 
-// parseCostReport parses the ziskemu COST DISTRIBUTION table:
-//
-//	BASE                         293,601,280  99.89%
-//	MAIN                             247,452   0.08%
-//	OPCODES                           11,069   0.00%
-//	PRECOMPILES                            0   0.00%
-//	MEMORY                            58,854   0.02%
-//	TOTAL                        293,918,655 100.00%
+// parseCostReport parses a COST DISTRIBUTION table from combined runner output.
+// Handles both ZisK (BASE/MAIN/OPCODES/PRECOMPILES/MEMORY/TOTAL) and
+// OpenVM (ELAPSED_MS/TOTAL) table formats.
 func parseCostReport(output string) (CostReport, bool) {
 	var r CostReport
 	sc := bufio.NewScanner(strings.NewReader(output))
@@ -229,6 +317,9 @@ func parseCostReport(output string) (CostReport, bool) {
 			r.Precompiles = v
 		} else if v, ok := parseCostLine(line, "MEMORY"); ok {
 			r.Memory = v
+		} else if v, ok := parseCostLine(line, "INSTRUCTIONS"); ok {
+			r.Instructions = v
+			found = true
 		} else if v, ok := parseCostLine(line, "TOTAL"); ok {
 			r.Total = v
 		}
@@ -236,7 +327,6 @@ func parseCostReport(output string) (CostReport, bool) {
 	return r, found
 }
 
-// parseCostLine extracts the numeric cost from a line like "BASE   293,601,280  99.89%".
 func parseCostLine(line, label string) (uint64, bool) {
 	rest, ok := strings.CutPrefix(line, label)
 	if !ok {
@@ -263,7 +353,6 @@ func extractBlockNum(name string) uint64 {
 	return n
 }
 
-// costStats computes min/p50/max/avg for a slice of uint64 values (must be sorted).
 type costStats struct {
 	Min, P50, Max, Avg uint64
 }
@@ -287,7 +376,22 @@ func computeStats(vals []uint64) costStats {
 	}
 }
 
-func printSummary(good []BlockResult, total, validationFailures int) {
+func printSummary(good []BlockResult, total, validationFailures int, target string) {
+	validated := len(good) - validationFailures
+	fmt.Printf("\n=== Results (%d/%d blocks, %d/%d validated) ===\n", len(good), total, validated, len(good))
+
+	if target == "openvm" {
+		insns := make([]uint64, len(good))
+		for i, r := range good {
+			insns[i] = r.Costs.Instructions
+		}
+		s := computeStats(insns)
+		fmt.Printf("%-14s %18s %18s %18s %18s\n", "INSTRUCTIONS", "MIN", "P50", "MAX", "AVG")
+		fmt.Printf("%s\n", strings.Repeat("-", 92))
+		fmt.Printf("%-14s %18d %18d %18d %18d\n", "INSTRUCTIONS", s.Min, s.P50, s.Max, s.Avg)
+		return
+	}
+
 	extract := func(fn func(CostReport) uint64) []uint64 {
 		vs := make([]uint64, len(good))
 		for i, r := range good {
@@ -295,8 +399,6 @@ func printSummary(good []BlockResult, total, validationFailures int) {
 		}
 		return vs
 	}
-	validated := len(good) - validationFailures
-	fmt.Printf("\n=== Results (%d/%d blocks, %d/%d validated) ===\n", len(good), total, validated, len(good))
 	fmt.Printf("%-14s %18s %18s %18s %18s\n", "COMPONENT", "MIN", "P50", "MAX", "AVG")
 	fmt.Printf("%s\n", strings.Repeat("-", 92))
 	for _, row := range []struct {
@@ -319,13 +421,16 @@ func printSummary(good []BlockResult, total, validationFailures int) {
 
 type reportData struct {
 	Generated        string
+	Target           string
 	Total            int
 	Good             int
 	Failed           int
 	ValidationFailed int
 	StatRows         []statRow
-	Labels           template.JS // JSON array of block numbers
-	TotalCosts       template.JS
+	Labels           template.JS
+	ElapsedMs         template.JS // outer wall-clock ms per block (both targets)
+	InstructionCounts template.JS // retired instruction count per block (OpenVM only)
+	TotalCosts       template.JS // ZisK only
 	BaseCosts        template.JS
 	MainCosts        template.JS
 	OpCosts          template.JS
@@ -346,7 +451,7 @@ type validationFailRow struct {
 	BlockNum        uint64
 	Name            string
 	ExpectedSuccess bool
-	ExecError       string // non-empty when execution failed
+	ExecError       string
 }
 
 type errorRow struct {
@@ -364,15 +469,8 @@ type statRow struct {
 	Avg   uint64
 }
 
-func writeReport(path string, good []BlockResult, all []BlockResult) error {
+func writeReport(path string, good []BlockResult, all []BlockResult, target string) error {
 	total := len(all)
-	extract := func(fn func(CostReport) uint64) []uint64 {
-		vs := make([]uint64, len(good))
-		for i, r := range good {
-			vs[i] = fn(r.Costs)
-		}
-		return vs
-	}
 
 	toJS := func(vs []uint64) template.JS {
 		var sb strings.Builder
@@ -388,30 +486,51 @@ func writeReport(path string, good []BlockResult, all []BlockResult) error {
 	}
 
 	blockNums := make([]uint64, len(good))
+	elapsedMs := make([]uint64, len(good))
+	instructionCounts := make([]uint64, len(good))
 	for i, r := range good {
 		blockNums[i] = r.BlockNum
+		elapsedMs[i] = uint64(r.Elapsed.Milliseconds())
+		instructionCounts[i] = r.Costs.Instructions
+	}
+
+	extract := func(fn func(CostReport) uint64) []uint64 {
+		vs := make([]uint64, len(good))
+		for i, r := range good {
+			vs[i] = fn(r.Costs)
+		}
+		return vs
 	}
 
 	var statRows []statRow
-	for _, row := range []struct {
-		label string
-		fn    func(CostReport) uint64
-	}{
-		{"BASE", func(c CostReport) uint64 { return c.Base }},
-		{"MAIN", func(c CostReport) uint64 { return c.Main }},
-		{"OPCODES", func(c CostReport) uint64 { return c.Opcodes }},
-		{"PRECOMPILES", func(c CostReport) uint64 { return c.Precompiles }},
-		{"MEMORY", func(c CostReport) uint64 { return c.Memory }},
-		{"TOTAL", func(c CostReport) uint64 { return c.Total }},
-	} {
-		s := computeStats(extract(row.fn))
-		statRows = append(statRows, statRow{
-			Label: row.label,
-			Min:   s.Min,
-			P50:   s.P50,
-			Max:   s.Max,
-			Avg:   s.Avg,
-		})
+	if target == "openvm" {
+		insns := make([]uint64, len(good))
+		for i, r := range good {
+			insns[i] = r.Costs.Instructions
+		}
+		s := computeStats(insns)
+		statRows = []statRow{{Label: "INSTRUCTIONS", Min: s.Min, P50: s.P50, Max: s.Max, Avg: s.Avg}}
+	} else {
+		for _, row := range []struct {
+			label string
+			fn    func(CostReport) uint64
+		}{
+			{"BASE", func(c CostReport) uint64 { return c.Base }},
+			{"MAIN", func(c CostReport) uint64 { return c.Main }},
+			{"OPCODES", func(c CostReport) uint64 { return c.Opcodes }},
+			{"PRECOMPILES", func(c CostReport) uint64 { return c.Precompiles }},
+			{"MEMORY", func(c CostReport) uint64 { return c.Memory }},
+			{"TOTAL", func(c CostReport) uint64 { return c.Total }},
+		} {
+			s := computeStats(extract(row.fn))
+			statRows = append(statRows, statRow{
+				Label: row.label,
+				Min:   s.Min,
+				P50:   s.P50,
+				Max:   s.Max,
+				Avg:   s.Avg,
+			})
+		}
 	}
 
 	var execFailedRows []execFailedRow
@@ -451,12 +570,15 @@ func writeReport(path string, good []BlockResult, all []BlockResult) error {
 
 	data := reportData{
 		Generated:        time.Now().Format(time.RFC1123),
+		Target:           target,
 		Total:            total,
 		Good:             len(good),
 		Failed:           len(execFailedRows),
 		ValidationFailed: len(validationFailRows),
 		StatRows:         statRows,
-		Labels:           toJS(blockNums),
+		Labels:            toJS(blockNums),
+		ElapsedMs:         toJS(elapsedMs),
+		InstructionCounts: toJS(instructionCounts),
 		TotalCosts:       toJS(extract(func(c CostReport) uint64 { return c.Total })),
 		BaseCosts:        toJS(extract(func(c CostReport) uint64 { return c.Base })),
 		MainCosts:        toJS(extract(func(c CostReport) uint64 { return c.Main })),
@@ -487,6 +609,8 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   body { font-family: system-ui, sans-serif; margin: 2rem; background: #f8f9fa; color: #212529; }
   h1 { font-size: 1.6rem; }
   .meta { color: #6c757d; font-size: 0.9rem; margin-bottom: 1.5rem; }
+  .target-badge { display: inline-block; padding: .1rem .5rem; border-radius: 4px; font-size: .8rem; font-weight: 600;
+                  background: #0d6efd; color: #fff; margin-left: .5rem; vertical-align: middle; }
   table { border-collapse: collapse; width: 100%; max-width: 700px; margin-bottom: 2rem; }
   th, td { border: 1px solid #dee2e6; padding: 0.4rem 0.8rem; text-align: right; }
   th:first-child, td:first-child { text-align: left; }
@@ -503,10 +627,10 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>zesu-zkvm Benchmark Report</h1>
+<h1>zesu-zkvm Benchmark Report <span class="target-badge">{{.Target}}</span></h1>
 <p class="meta">Generated: {{.Generated}} &nbsp;|&nbsp; Blocks: {{.Good}}/{{.Total}} succeeded{{if .ValidationFailed}} &nbsp;|&nbsp; <span style="color:#dc3545">{{.ValidationFailed}} validation failure(s)</span>{{end}}{{if .Failed}} &nbsp;|&nbsp; {{.Failed}} expected failure(s){{end}}</p>
 
-<h2>Cost Summary</h2>
+<h2>Summary</h2>
 <table>
   <thead><tr><th>Component</th><th>Min</th><th>P50</th><th>Max</th><th>Avg</th></tr></thead>
   <tbody>
@@ -522,11 +646,21 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   </tbody>
 </table>
 
+{{if eq .Target "openvm"}}
+<h2>Instruction Count by Block</h2>
+<div class="chart-wrap"><canvas id="instructionChart"></canvas></div>
+{{end}}
+
+<h2>Wall-Clock Time by Block (ms)</h2>
+<div class="chart-wrap"><canvas id="elapsedChart"></canvas></div>
+
+{{if eq .Target "zisk"}}
 <h2>Total Cost by Block</h2>
 <div class="chart-wrap"><canvas id="totalChart"></canvas></div>
 
 <h2>Cost Breakdown by Block</h2>
 <div class="chart-wrap"><canvas id="stackedChart"></canvas></div>
+{{end}}
 
 {{if .ValidationFails}}
 <h2>Validation Failures ({{len .ValidationFails}} blocks)</h2>
@@ -580,14 +714,69 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 {{end}}
 
 <script>
-const labels = {{.Labels}};
-const totalCosts = {{.TotalCosts}};
+const labels             = {{.Labels}};
+const elapsedMs          = {{.ElapsedMs}};
+const instructionCounts  = {{.InstructionCounts}};
+const totalCosts         = {{.TotalCosts}};
 const baseCosts  = {{.BaseCosts}};
 const mainCosts  = {{.MainCosts}};
 const opCosts    = {{.OpCosts}};
 const preCosts   = {{.PreCosts}};
 const memCosts   = {{.MemCosts}};
 
+{{if eq .Target "openvm"}}
+new Chart(document.getElementById('instructionChart'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [{
+      label: 'Instructions',
+      data: instructionCounts,
+      borderColor: '#0d6efd',
+      backgroundColor: 'rgba(13,110,253,0.08)',
+      borderWidth: 1.5,
+      pointRadius: 2,
+      fill: true,
+      tension: 0.2,
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { title: { display: true, text: 'Block Number' } },
+      y: { title: { display: true, text: 'Retired Instructions' }, beginAtZero: true }
+    }
+  }
+});
+{{end}}
+
+new Chart(document.getElementById('elapsedChart'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [{
+      label: 'Elapsed (ms)',
+      data: elapsedMs,
+      borderColor: '#20c997',
+      backgroundColor: 'rgba(32,201,151,0.08)',
+      borderWidth: 1.5,
+      pointRadius: 2,
+      fill: true,
+      tension: 0.2,
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { title: { display: true, text: 'Block Number' } },
+      y: { title: { display: true, text: 'ms' }, beginAtZero: true }
+    }
+  }
+});
+
+{{if eq .Target "zisk"}}
 new Chart(document.getElementById('totalChart'), {
   type: 'line',
   data: {
@@ -634,6 +823,7 @@ new Chart(document.getElementById('stackedChart'), {
     }
   }
 });
+{{end}}
 </script>
 </body>
 </html>
@@ -660,4 +850,3 @@ func collectJSON(path string) ([]string, error) {
 	sort.Strings(paths)
 	return paths, nil
 }
-

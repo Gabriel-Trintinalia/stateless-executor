@@ -151,7 +151,14 @@ func main() {
 			// what a correct stateless verifier (zesu) should emit.
 			expectedSuccess := len(expectedOutputHex) < 66 || expectedOutputHex[64:66] != "00"
 			outputMatch := expectedOutputHex == "" || gotOutputCmp == expectedOutputHex
-			validationOK := *dumpDir != "" || (runErr == nil && gotSuccess == expectedSuccess && outputMatch)
+			// SSZ-output match is the authoritative pass/fail signal. We do NOT
+			// consult ExpectException: for fixtures built with Block.rlp_modifier
+			// the corruption only exists in the RLP block, while statelessInputBytes
+			// (and statelessOutputBytes) still describe the canonical pre-modifier
+			// block — so a spec-compliant guest correctly returns successful_validation
+			// for those inputs even though ExpectException is set. See the EELS
+			// fixture-format issue for the full story.
+			validationOK := *dumpDir != "" || (runErr == nil && outputMatch)
 
 			n := done.Add(1)
 			status := "OK"
@@ -160,11 +167,7 @@ func main() {
 			} else if runErr != nil {
 				status = fmt.Sprintf("ERROR: %v", runErr)
 			} else if !validationOK {
-				if gotSuccess != expectedSuccess {
-					status = fmt.Sprintf("VALIDATION FAILED (expected success=%v got=%v)", expectedSuccess, gotSuccess)
-				} else {
-					status = "VALIDATION FAILED (output mismatch)"
-				}
+				status = "VALIDATION FAILED (output mismatch)"
 			}
 			fmt.Printf("[%3d/%d] %s  [%s]  %s  (%s)\n",
 				n, len(items), truncateName(it.name), it.network, status, elapsed.Round(time.Millisecond))
@@ -254,7 +257,7 @@ func runOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, elfPath, ziske
 		CombinedOutput()
 	rawOut := strings.TrimSpace(string(cmd))
 	if err != nil {
-		return false, "", rawOut, fmt.Errorf("ziskemu: %w", err)
+		return false, "", rawOut, fmt.Errorf("zkvm: %w", err)
 	}
 
 	// success=1 in the zesu UART log means EVM execution succeeded.
