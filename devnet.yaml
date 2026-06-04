@@ -1,7 +1,7 @@
 participants_matrix:
   el:
     - el_type: besu
-      el_image: hyperledger/besu:26.6-develop-fc46729
+      el_image: hyperledger/besu:26.6-develop-e35012f
   cl:
     - cl_type: lighthouse
       cl_image: ethpandaops/lighthouse:bal-devnet-7
