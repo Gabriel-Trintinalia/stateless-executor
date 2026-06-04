@@ -62,8 +62,8 @@ func TestSszChainConfig_ActiveFork(t *testing.T) {
 		wantFork    uint64 // ProtocolFork enum index
 		wantBlobMax uint64
 	}{
-		{0, 24, 12},    // osakaTime maps to Amsterdam (enum 24)
-		{999, 24, 12},  // still Amsterdam before BPO1
+		{0, 18, 12},    // Osaka (enum 18) active at t=0
+		{999, 18, 12},  // still Osaka before BPO1
 		{1000, 19, 21}, // BPO1 (enum 19) activates at t=1000
 		{1999, 19, 21}, // still BPO1 before Amsterdam
 		{2000, 24, 21}, // Amsterdam (enum 24) activates at t=2000

@@ -21,7 +21,10 @@ var forkDefs = []struct {
 }{
 	{"cancunTime", "cancun", 16},
 	{"pragueTime", "prague", 17},
-	{"osakaTime", "osaka", 24}, // genesis generators use osakaTime for Amsterdam activation
+	{"osakaTime", "osaka", 18},
+	// Note: some genesis generators omit amsterdamTime and set osakaTime as the
+	// latest fork. Where amsterdamTime is present it takes precedence via the
+	// enum ordering (24 > 18).
 	{"bpo1Time", "bpo1", 19},
 	{"bpo2Time", "bpo2", 20},
 	{"bpo3Time", "bpo3", 21},
@@ -125,6 +128,7 @@ func (g *GenesisChainConfig) SszChainConfig(blockTimestamp uint64) []byte {
 	}
 	return nil
 }
+
 
 // buildSszChainConfig encodes SszChainConfig for a single active fork with one
 // blob schedule entry. Layout mirrors sszChainConfigAmsterdamMainnet — see
