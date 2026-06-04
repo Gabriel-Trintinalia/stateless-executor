@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
@@ -26,17 +27,17 @@ import (
 
 // TestResult holds the outcome of running one zkevm test block.
 type TestResult struct {
-	Name                string
-	Network             string
-	ExpectedSuccess     bool
-	GotSuccess          bool
-	ExpectedOutputHex   string
-	GotOutputHex        string
-	OutputMatch         bool
-	ValidationOK        bool
-	Err                 error
-	ErrOutput           string
-	Elapsed             time.Duration
+	Name              string
+	Network           string
+	ExpectedSuccess   bool
+	GotSuccess        bool
+	ExpectedOutputHex string
+	GotOutputHex      string
+	OutputMatch       bool
+	ValidationOK      bool
+	Err               error
+	ErrOutput         string
+	Elapsed           time.Duration
 }
 
 func main() {
@@ -133,15 +134,22 @@ func main() {
 				gotSuccess, gotOutputHex, rawOut, runErr = runOne(it.tc, it.block, *elfPath, *ziskemuPath)
 			}
 			elapsed := time.Since(t)
-			// Engine-API-layer expectation, kept only for the report's informational
-			// "Expected" column — not consulted for the pass/fail decision below.
-			expectedSuccess := it.block.ExpectException == ""
 			expectedOutputHex := strings.ToLower(strings.TrimPrefix(it.block.StatelessOutputBytes, "0x"))
 			// ziskemu's -o writes the full output region (zero-padded), so trim got to expected's length.
 			gotOutputCmp := gotOutputHex
 			if len(expectedOutputHex) > 0 && len(gotOutputCmp) > len(expectedOutputHex) {
 				gotOutputCmp = gotOutputCmp[:len(expectedOutputHex)]
 			}
+			// bal-devnet-7 / zkevm@v0.4.1: expectedSuccess comes from the fixture's
+			// SszStatelessValidationResult byte 32 (successful_validation), NOT from
+			// the block-level expectException field. Reason: expectException asserts
+			// the block is invalid at some layer, but the t8n pipeline's stateless
+			// serializer still produces successful_validation=01 for several
+			// BlockException classes (e.g. INVALID_BLOCK_ACCESS_LIST, INVALID_REQUESTS)
+			// where t8n built the block successfully even though the block is
+			// invalid. Trusting the fixture's serialized byte aligns the runner with
+			// what a correct stateless verifier (zesu) should emit.
+			expectedSuccess := len(expectedOutputHex) < 66 || expectedOutputHex[64:66] != "00"
 			outputMatch := expectedOutputHex == "" || gotOutputCmp == expectedOutputHex
 			// SSZ-output match is the authoritative pass/fail signal. We do NOT
 			// consult ExpectException: for fixtures built with Block.rlp_modifier
@@ -154,7 +162,9 @@ func main() {
 
 			n := done.Add(1)
 			status := "OK"
-			if runErr != nil {
+			if isSkipped(runErr) {
+				status = fmt.Sprintf("SKIP: %v", runErr)
+			} else if runErr != nil {
 				status = fmt.Sprintf("ERROR: %v", runErr)
 			} else if !validationOK {
 				status = "VALIDATION FAILED (output mismatch)"
@@ -279,11 +289,13 @@ func filterUARTLog(rawOut string) string {
 }
 
 func printSummary(results []TestResult) {
-	var passed, failed, errored int
+	var passed, failed, errored, skipped int
 	var failures []TestResult
 	sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
 	for _, r := range results {
-		if r.Err != nil {
+		if isSkipped(r.Err) {
+			skipped++
+		} else if r.Err != nil {
 			errored++
 		} else if r.ValidationOK {
 			passed++
@@ -293,8 +305,8 @@ func printSummary(results []TestResult) {
 		}
 	}
 	total := len(results)
-	fmt.Printf("\n=== SUMMARY: %d/%d passed, %d validation failures, %d errors ===\n",
-		passed, total, failed, errored)
+	fmt.Printf("\n=== SUMMARY: %d/%d passed, %d validation failures, %d errors, %d skipped ===\n",
+		passed, total, failed, errored, skipped)
 	if len(failures) > 0 {
 		fmt.Println("\nValidation failures:")
 		for _, r := range failures {
@@ -306,13 +318,15 @@ func printSummary(results []TestResult) {
 // ── HTML report ───────────────────────────────────────────────────────────────
 
 type reportData struct {
-	Generated    string
-	Total        int
-	Passed       int
-	Failed       int
-	Errored      int
-	Failures     []failureRow
-	Errors       []errorRow
+	Generated string
+	Total     int
+	Passed    int
+	Failed    int
+	Errored   int
+	Skipped   int
+	Failures  []failureRow
+	Errors    []errorRow
+	Skips     []errorRow
 }
 
 type failureRow struct {
@@ -337,10 +351,19 @@ type errorRow struct {
 func writeReport(path string, results []TestResult) error {
 	var failures []failureRow
 	var errors []errorRow
-	passed, errored := 0, 0
+	var skips []errorRow
+	passed, errored, skipped := 0, 0, 0
 
 	for _, r := range results {
-		if r.Err != nil {
+		if isSkipped(r.Err) {
+			skipped++
+			skips = append(skips, errorRow{
+				Name:    r.Name,
+				Network: r.Network,
+				ErrMsg:  r.Err.Error(),
+				Output:  r.ErrOutput,
+			})
+		} else if r.Err != nil {
 			errored++
 			errors = append(errors, errorRow{
 				Name:    r.Name,
@@ -375,6 +398,7 @@ func writeReport(path string, results []TestResult) error {
 
 	sort.Slice(failures, func(i, j int) bool { return failures[i].Name < failures[j].Name })
 	sort.Slice(errors, func(i, j int) bool { return errors[i].Name < errors[j].Name })
+	sort.Slice(skips, func(i, j int) bool { return skips[i].Name < skips[j].Name })
 
 	data := reportData{
 		Generated: time.Now().Format(time.RFC1123),
@@ -382,8 +406,10 @@ func writeReport(path string, results []TestResult) error {
 		Passed:    passed,
 		Failed:    len(failures),
 		Errored:   errored,
+		Skipped:   skipped,
 		Failures:  failures,
 		Errors:    errors,
+		Skips:     skips,
 	}
 
 	f, err := os.Create(path)
@@ -401,25 +427,32 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>zkevm-runner Report</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 2rem; background: #f8f9fa; color: #212529; }
-  h1 { font-size: 1.6rem; }
-  h2 { font-size: 1.2rem; margin-top: 2rem; }
-  .meta { color: #6c757d; font-size: 0.9rem; margin-bottom: 1.5rem; }
-  .pill { display: inline-block; padding: .2rem .6rem; border-radius: 1rem; font-size: .85rem; font-weight: 600; margin-right: .4rem; }
+  body { font-family: system-ui, sans-serif; margin: 1rem 1.5rem; background: #f8f9fa; color: #212529; font-size: .9rem; }
+  h1 { font-size: 1.3rem; margin-bottom: .25rem; }
+  .meta { color: #6c757d; font-size: .8rem; margin-bottom: .75rem; }
+  .pill { display: inline-block; padding: .15rem .5rem; border-radius: 1rem; font-size: .78rem; font-weight: 600; margin-right: .3rem; }
   .pill-green { background: #d1e7dd; color: #0a3622; }
   .pill-red   { background: #f8d7da; color: #58151c; }
   .pill-orange{ background: #fff3cd; color: #664d03; }
   .pill-grey  { background: #e2e3e5; color: #41464b; }
-  table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
-  th, td { border: 1px solid #dee2e6; padding: .4rem .8rem; text-align: left; vertical-align: top; }
-  thead th { background: #343a40; color: #fff; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 1rem; }
+  th, td { border: 1px solid #dee2e6; padding: .2rem .5rem; text-align: left; vertical-align: top; font-size: .8rem; }
+  thead th { background: #343a40; color: #fff; font-size: .78rem; }
   tbody tr:nth-child(even) { background: #f1f3f5; }
-  .mono { font-family: monospace; font-size: .85rem; }
-  .tag-network { display:inline-block; padding:.1rem .4rem; border-radius:.3rem; background:#cfe2ff; color:#084298; font-size:.8rem; }
+  .mono { font-family: monospace; font-size: .78rem; }
+  .tag-network { display:inline-block; padding:.05rem .3rem; border-radius:.3rem; background:#cfe2ff; color:#084298; font-size:.72rem; }
   .tag-pass  { color: #0a3622; }
   .tag-fail  { color: #58151c; }
-  pre { margin:.4rem 0; padding:.5rem; background:#f1f3f5; border-radius:4px; overflow-x:auto; font-size:.8rem; white-space:pre-wrap; word-break:break-all; }
+  pre { margin:.2rem 0; padding:.3rem .5rem; background:#f1f3f5; border-radius:4px; overflow-x:auto; font-size:.75rem; white-space:pre-wrap; word-break:break-all; }
   details summary { cursor: pointer; }
+  .tabs { display: flex; gap: 0; border-bottom: 2px solid #dee2e6; margin-top: 1rem; }
+  .tab-btn { padding: .35rem .9rem; border: 1px solid transparent; border-bottom: none;
+             background: none; cursor: pointer; font-size: .85rem; font-weight: 600;
+             color: #6c757d; border-radius: .3rem .3rem 0 0; }
+  .tab-btn:hover { background: #e9ecef; color: #212529; }
+  .tab-btn.active { background: #fff; border-color: #dee2e6; color: #212529; margin-bottom: -2px; }
+  .tab-panel { display: none; padding-top: .6rem; }
+  .tab-panel.active { display: block; }
 </style>
 </head>
 <body>
@@ -431,10 +464,20 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   <span class="pill pill-green">{{.Passed}} passed</span>
   {{if .Failed}}<span class="pill pill-red">{{.Failed}} validation failures</span>{{end}}
   {{if .Errored}}<span class="pill pill-orange">{{.Errored}} errors</span>{{end}}
+  {{if .Skipped}}<span class="pill pill-grey">{{.Skipped}} skipped</span>{{end}}
 </p>
 
+{{if and (eq .Failed 0) (eq .Errored 0) (eq .Skipped 0)}}
+<p style="color:#0a3622;font-weight:600">All {{.Total}} tests passed.</p>
+{{else}}
+<div class="tabs">
+  {{if .Failures}}<button class="tab-btn{{if .Failures}} active{{end}}" onclick="showTab('failures')">Validation Failures ({{.Failed}})</button>{{end}}
+  {{if .Errors}}<button class="tab-btn{{if not .Failures}} active{{end}}" onclick="showTab('errors')">Errors ({{.Errored}})</button>{{end}}
+  {{if .Skips}}<button class="tab-btn" onclick="showTab('skipped')">Skipped ({{.Skipped}})</button>{{end}}
+</div>
+
 {{if .Failures}}
-<h2>Validation Failures ({{.Failed}})</h2>
+<div id="tab-failures" class="tab-panel active">
 <table>
   <thead><tr><th>Test</th><th>Network</th><th>Expected</th><th>Got</th><th>Output</th><th>Error</th><th>Time</th></tr></thead>
   <tbody>
@@ -452,10 +495,11 @@ got:      {{.GotOutputHex}}</pre></details>{{end}}</td>
   {{end}}
   </tbody>
 </table>
+</div>
 {{end}}
 
 {{if .Errors}}
-<h2>Errors ({{.Errored}})</h2>
+<div id="tab-errors" class="tab-panel{{if not .Failures}} active{{end}}">
 <table>
   <thead><tr><th>Test</th><th>Network</th><th>Error</th></tr></thead>
   <tbody>
@@ -473,15 +517,44 @@ got:      {{.GotOutputHex}}</pre></details>{{end}}</td>
   {{end}}
   </tbody>
 </table>
+</div>
 {{end}}
 
-{{if and (eq .Failed 0) (eq .Errored 0)}}
-<p style="color:#0a3622;font-weight:600">All {{.Total}} tests passed.</p>
+{{if .Skips}}
+<div id="tab-skipped" class="tab-panel">
+<table>
+  <thead><tr><th>Test</th><th>Network</th><th>Reason</th></tr></thead>
+  <tbody>
+  {{range .Skips}}
+  <tr>
+    <td class="mono">{{.Name}}</td>
+    <td><span class="tag-network">{{.Network}}</span></td>
+    <td class="mono">{{.ErrMsg}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
 {{end}}
 
+<script>
+function showTab(id) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + id).classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    if (b.getAttribute('onclick') === "showTab('" + id + "')") b.classList.add('active');
+  });
+}
+</script>
 </body>
 </html>
 `))
+
+func isSkipped(err error) bool {
+	return errors.Is(err, fixture.ErrMissingStatelessInputBytes)
+}
 
 func truncateName(s string) string {
 	const half = 40

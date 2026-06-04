@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -14,23 +15,38 @@ import (
 	"github.com/holiman/uint256"
 )
 
+var ErrMissingStatelessInputBytes = errors.New("statelessInputBytes missing — only SSZ fixtures are supported")
+
 // ZesuInputFromZkevmBlock encodes a single zkevm blockchain test block as a
 // ziskemu-ready binary input. Requires the fixture to carry pre-encoded SSZ
 // statelessInputBytes (Amsterdam+); pre-Amsterdam fixtures are unsupported.
+//
+// bal-devnet-7 / zkevm@v0.4.1: the fixture's statelessInputBytes already
+// includes the 2-byte schema id and the full SszChainConfig (with active
+// fork descriptor), so no injection is needed — the runner just wraps the
+// raw bytes in the ziskemu length-prefixed framing.
 func ZesuInputFromZkevmBlock(tc *ZkevmTestCase, block *ZkevmBlock) ([]byte, bool, error) {
+	_ = tc
 	expectedSuccess := block.ExpectException == ""
 	if block.StatelessInputBytes == "" {
-		return nil, expectedSuccess, fmt.Errorf("statelessInputBytes missing — only SSZ fixtures are supported")
+		return nil, expectedSuccess, ErrMissingStatelessInputBytes
 	}
-	payload, contentLen, err := injectForkName(block.StatelessInputBytes, tc.Network)
+	ssz, err := hexStrToBytes(block.StatelessInputBytes)
 	if err != nil {
-		return nil, false, fmt.Errorf("inject fork name: %w", err)
+		return nil, false, fmt.Errorf("decode statelessInputBytes: %w", err)
+	}
+	contentLen := len(ssz)
+	// Ziskemu requires payload length to be a multiple of 8 bytes; pad
+	// with zeros AFTER the content. The length header carries the true
+	// (unpadded) content length so the guest sees only the SSZ bytes.
+	for len(ssz)%8 != 0 {
+		ssz = append(ssz, 0)
 	}
 	var out bytes.Buffer
 	var lenBuf [8]byte
 	binary.LittleEndian.PutUint64(lenBuf[:], uint64(contentLen))
 	out.Write(lenBuf[:])
-	out.Write(payload)
+	out.Write(ssz)
 	return out.Bytes(), expectedSuccess, nil
 }
 
