@@ -1,21 +1,21 @@
-// Package runner executes a guest binary against binary block input and
-// parses the JSON result line written to stdout.
+// Package runner executes a guest binary against SSZ block input and
+// parses the binary SszStatelessValidationResult written to stdout.
 //
 // Guest contract:
-//   - stdin:  binary StatelessInput (pipeline.Fetch output)
-//   - stdout: one JSON line: {"block":N,"valid":true,"pre_state_root":"0x...","post_state_root":"0x...","receipts_root":"0x..."}
+//   - stdin:  raw SSZ SszStatelessInput (no framing)
+//   - stdout: binary SszStatelessValidationResult
+//             [0..32] new_payload_request_root, [32] successful_validation
 //   - stderr: informational (logged but not parsed)
 package runner
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,7 +30,7 @@ type GuestSpec struct {
 }
 
 // ParseGuestSpecs parses the GUEST_BINARIES env var value.
-// Format: "name:/path/to/binary,name2:/path/to/binary2"
+// Format: "name:/path/to/binary[,name2:/path/to/binary2]"
 func ParseGuestSpecs(s string) ([]GuestSpec, error) {
 	var specs []GuestSpec
 	for _, entry := range strings.Split(s, ",") {
@@ -53,17 +53,10 @@ func ParseGuestSpecs(s string) ([]GuestSpec, error) {
 	return specs, nil
 }
 
-// guestResult is the JSON line emitted by the guest to stdout.
-type guestResult struct {
-	Block uint64 `json:"block"`
-	Valid bool   `json:"valid"`
-}
-
 // Run executes the guest binary at spec.Path, feeding input via stdin, and
 // returns a store.Result ready to be added to the ring buffer.
-//
-// forkName is optional (e.g. "cancun"); if non-empty it is passed as --fork.
-func Run(ctx context.Context, spec GuestSpec, input []byte, forkName string) (store.Result, error) {
+// blockNum is set on the result since the guest output does not include it.
+func Run(ctx context.Context, spec GuestSpec, input []byte, blockNum uint64) (store.Result, error) {
 	// Ensure the binary is executable (Kurtosis file artifacts may drop the bit).
 	if err := os.Chmod(spec.Path, 0755); err != nil {
 		log.Printf("runner [%s]: chmod %s: %v (continuing)", spec.Name, spec.Path, err)
@@ -71,13 +64,9 @@ func Run(ctx context.Context, spec GuestSpec, input []byte, forkName string) (st
 
 	start := time.Now()
 
-	args := []string{}
-	if forkName != "" {
-		args = append(args, "--fork", forkName)
-	}
-
-	cmd := exec.CommandContext(ctx, spec.Path, args...)
+	cmd := exec.CommandContext(ctx, spec.Path)
 	cmd.Stdin = bytes.NewReader(input)
+	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+filepath.Dir(spec.Path))
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -97,42 +86,31 @@ func Run(ctx context.Context, spec GuestSpec, input []byte, forkName string) (st
 		return store.Result{Log: logOutput}, fmt.Errorf("runner [%s]: %w", spec.Name, err)
 	}
 
-	line, parseErr := lastJSONLine(stdout.Bytes())
-	if parseErr != nil {
+	// SszStatelessValidationResult layout:
+	//   [0..32]  new_payload_request_root (Bytes32)
+	//   [32]     successful_validation (boolean: 0x00 or 0x01)
+	//   [33..37] offset to chain_config (uint32 LE)
+	//   [37..]   chain_config SSZ bytes
+	out := stdout.Bytes()
+	if len(out) < 33 {
 		metrics.BlockVerifiedTotal.WithLabelValues(spec.Name, "error").Inc()
 		metrics.VerificationDurationMs.WithLabelValues(spec.Name).Observe(float64(durationMs))
-		return store.Result{Log: logOutput}, fmt.Errorf("runner [%s]: parsing output: %w (stdout=%q)", spec.Name, parseErr, stdout.String())
+		return store.Result{Log: logOutput}, fmt.Errorf("runner [%s]: output too short (%d bytes)", spec.Name, len(out))
 	}
+	valid := out[32] == 0x01
 
 	result := "ok"
-	if !line.Valid {
+	if !valid {
 		result = "fail"
 	}
 	metrics.BlockVerifiedTotal.WithLabelValues(spec.Name, result).Inc()
 	metrics.VerificationDurationMs.WithLabelValues(spec.Name).Observe(float64(durationMs))
 
 	return store.Result{
-		Block:      line.Block,
+		Block:      blockNum,
 		Guest:      spec.Name,
-		Valid:      line.Valid,
+		Valid:      valid,
 		Log:        logOutput,
 		DurationMs: durationMs,
 	}, nil
-}
-
-// lastJSONLine finds the last non-empty line in buf and parses it as guestResult.
-func lastJSONLine(buf []byte) (guestResult, error) {
-	lines := bytes.Split(bytes.TrimRight(buf, "\n"), []byte("\n"))
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := bytes.TrimSpace(lines[i])
-		if len(line) == 0 {
-			continue
-		}
-		var r guestResult
-		if err := json.Unmarshal(line, &r); err != nil {
-			return guestResult{}, fmt.Errorf("invalid JSON %q: %w", line, err)
-		}
-		return r, nil
-	}
-	return guestResult{}, io.EOF
 }

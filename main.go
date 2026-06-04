@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/Gabriel-Trintinalia/stateless-executor/fixture"
 	"github.com/Gabriel-Trintinalia/stateless-executor/metrics"
 	"github.com/Gabriel-Trintinalia/stateless-executor/pipeline"
 	"github.com/Gabriel-Trintinalia/stateless-executor/pool"
@@ -23,11 +26,25 @@ import (
 func main() {
 	// ── Config from environment ────────────────────────────────────────────────
 	elURLs := splitEnv("EL_RPC_URLS")
-	forkName := os.Getenv("FORK_NAME")
 	listenAddr := envOr("LISTEN_ADDR", ":8080")
+	verbose := os.Getenv("VERBOSE") == "true"
+	engineURL := os.Getenv("ENGINE_RPC_URL")
+	jwtSecretFile := os.Getenv("JWT_SECRET_FILE")
 
 	if len(elURLs) == 0 {
 		log.Fatal("EL_RPC_URLS is required (comma-separated list of RPC endpoints)")
+	}
+
+	var genesis *fixture.GenesisChainConfig
+	if path := os.Getenv("GENESIS_FILE"); path != "" {
+		var err error
+		genesis, err = fixture.ParseGenesisFile(path)
+		if err != nil {
+			log.Fatalf("GENESIS_FILE: %v", err)
+		}
+		log.Printf("genesis: chainId=%d forks=%d", genesis.ChainID, genesis.ForkCount())
+	} else {
+		log.Printf("GENESIS_FILE not set — using hardcoded Amsterdam mainnet chain config")
 	}
 
 	guests, err := runner.ParseGuestSpecs(os.Getenv("GUEST_BINARIES"))
@@ -50,10 +67,18 @@ func main() {
 	}
 	go p.Run(ctx)
 
-	// ── Ring buffer ────────────────────────────────────────────────────────────
+	// ── One-shot mode (BLOCK_NUMBER set) ───────────────────────────────────────
+	if blockStr := os.Getenv("BLOCK_NUMBER"); blockStr != "" {
+		blockNum, err := strconv.ParseUint(blockStr, 10, 64)
+		if err != nil {
+			log.Fatalf("BLOCK_NUMBER: %v", err)
+		}
+		os.Exit(runBlock(ctx, p, genesis, guests, blockNum, verbose, engineURL, jwtSecretFile))
+	}
+
+	// ── Live mode ──────────────────────────────────────────────────────────────
 	buf := &store.RingBuffer{}
 
-	// ── HTTP server ────────────────────────────────────────────────────────────
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/results", buf.Handler())
@@ -66,7 +91,6 @@ func main() {
 		}
 	}()
 
-	// ── Block pipeline ─────────────────────────────────────────────────────────
 	log.Println("Waiting for new block heads...")
 	for {
 		select {
@@ -78,16 +102,22 @@ func main() {
 
 		case blockNum := <-p.Heads:
 			metrics.BlockHeight.Set(float64(blockNum))
-			log.Printf("block #%d: fetching", blockNum)
+			log.Printf("")
+		log.Printf("──────────────────────────────── block #%d ────────────────────────────────", blockNum)
 
 			fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
-			input, elNode, meta, err := pipeline.Fetch(fetchCtx, p, blockNum)
+			input, elNode, meta, err := pipeline.Fetch(fetchCtx, p, blockNum, genesis, verbose, engineURL, jwtSecretFile)
 			fetchCancel()
 			if err != nil {
 				log.Printf("block #%d: fetch error: %v", blockNum, err)
 				continue
 			}
-			log.Printf("block #%d: encoded %d bytes from %s, fanning out to %d guest(s)", blockNum, len(input), elNode, len(guests))
+			log.Printf("block #%d from %s | txs=%d gas=%d/%d base_fee=%d slot=%d bal=%d",
+				blockNum, elNode, meta.TxCount, meta.GasUsed, meta.GasLimit,
+				meta.BaseFee, meta.SlotNumber, meta.BALBytes)
+			if verbose {
+				log.Printf("block #%d: statelessInputBytes 0x%x", blockNum, input)
+			}
 
 			var wg sync.WaitGroup
 			for _, g := range guests {
@@ -97,7 +127,7 @@ func main() {
 					runCtx, runCancel := context.WithTimeout(ctx, 5*time.Minute)
 					defer runCancel()
 
-					result, err := runner.Run(runCtx, spec, input, forkName)
+					result, err := runner.Run(runCtx, spec, input, blockNum)
 					result.WitnessFrom = elNode
 					result.TxCount = meta.TxCount
 					result.GasUsed = meta.GasUsed
@@ -118,6 +148,52 @@ func main() {
 			wg.Wait()
 		}
 	}
+}
+
+// runBlock fetches and verifies a single block, prints results, and returns
+// an exit code (0 = all valid, 1 = any failure or error).
+func runBlock(ctx context.Context, p *pool.Pool, genesis *fixture.GenesisChainConfig, guests []runner.GuestSpec, blockNum uint64, verbose bool, engineURL, jwtSecretFile string) int {
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
+	input, elNode, meta, err := pipeline.Fetch(fetchCtx, p, blockNum, genesis, verbose, engineURL, jwtSecretFile)
+	fetchCancel()
+	if err != nil {
+		log.Printf("block #%d: fetch error: %v", blockNum, err)
+		return 1
+	}
+	log.Printf("──────────────────────────────── block #%d ────────────────────────────────", blockNum)
+	log.Printf("block #%d: %d bytes from %s | txs=%d gas=%d", blockNum, len(input), elNode, meta.TxCount, meta.GasUsed)
+	if verbose {
+		log.Printf("block #%d: statelessInputBytes 0x%x", blockNum, input)
+	}
+
+	exitCode := 0
+	var wg sync.WaitGroup
+	for _, g := range guests {
+		wg.Add(1)
+		go func(spec runner.GuestSpec) {
+			defer wg.Done()
+			runCtx, runCancel := context.WithTimeout(ctx, 5*time.Minute)
+			defer runCancel()
+
+			result, err := runner.Run(runCtx, spec, input, blockNum)
+			result.WitnessFrom = elNode
+			result.TxCount = meta.TxCount
+			result.GasUsed = meta.GasUsed
+			if err != nil {
+				fmt.Printf("block #%d [%s]: ERROR: %v\n", blockNum, spec.Name, err)
+				exitCode = 1
+				return
+			}
+			if result.Valid {
+				fmt.Printf("block #%d [%s]: OK (%dms)\n", blockNum, spec.Name, result.DurationMs)
+			} else {
+				fmt.Printf("block #%d [%s]: FAIL (%dms)\n", blockNum, spec.Name, result.DurationMs)
+				exitCode = 1
+			}
+		}(g)
+	}
+	wg.Wait()
+	return exitCode
 }
 
 func splitEnv(key string) []string {
