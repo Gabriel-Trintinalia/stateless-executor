@@ -4,7 +4,7 @@
 // Guest contract:
 //   - stdin:  raw SSZ SszStatelessInput (no framing)
 //   - stdout: binary SszStatelessValidationResult
-//             [0..32] new_payload_request_root, [32] successful_validation
+//     [0..32] new_payload_request_root, [32] successful_validation
 //   - stderr: informational (logged but not parsed)
 package runner
 

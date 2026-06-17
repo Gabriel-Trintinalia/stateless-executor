@@ -39,12 +39,12 @@ import (
 // BlockMeta holds all SszExecutionPayload fields for logging.
 type BlockMeta struct {
 	// header
-	ParentHash    string
-	Coinbase      string
-	StateRoot     string
-	ReceiptsRoot  string
-	PrevRandao    string
-	ExtraData     string
+	ParentHash   string
+	Coinbase     string
+	StateRoot    string
+	ReceiptsRoot string
+	PrevRandao   string
+	ExtraData    string
 	// numeric
 	TxCount       int
 	WithdrawCount int
@@ -60,10 +60,10 @@ type BlockMeta struct {
 
 // witness mirrors the JSON returned by debug_executionWitness.
 type witness struct {
-	State           []string        `json:"state"`
-	Codes           []string        `json:"codes"`
-	Keys            []string        `json:"keys"`
-	Headers         json.RawMessage `json:"headers"` // []string (hex) or []object depending on client
+	State   []string        `json:"state"`
+	Codes   []string        `json:"codes"`
+	Keys    []string        `json:"keys"`
+	Headers json.RawMessage `json:"headers"` // []string (hex) or []object depending on client
 }
 
 // Fetch retrieves the block RLP and witness for blockNum, then encodes them
@@ -376,8 +376,8 @@ func verifyBALHash(blockNum uint64, balBytes []byte, block *types.Block) {
 }
 
 type balAccountChangeJSON struct {
-	Address        string                `json:"address"`
-	StorageReads   []string              `json:"storageReads"`
+	Address        string                 `json:"address"`
+	StorageReads   []string               `json:"storageReads"`
 	StorageChanges []balStorageChangeJSON `json:"storageChanges"`
 	BalanceChanges []balBalanceChangeJSON `json:"balanceChanges"`
 	NonceChanges   []balNonceChangeJSON   `json:"nonceChanges"`
@@ -385,7 +385,7 @@ type balAccountChangeJSON struct {
 }
 
 type balStorageChangeJSON struct {
-	Slot    string               `json:"slot"`
+	Slot    string                `json:"slot"`
 	Changes []balStorageWriteJSON `json:"changes"`
 }
 

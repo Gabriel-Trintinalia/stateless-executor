@@ -104,12 +104,12 @@ func encodeExecutionPayloadFromBlock(block *types.Block, balBytes []byte) ([]byt
 	balOff := wdsOff + uint32(len(wdsSSZ))
 
 	var fix bytes.Buffer
-	fix.Write(h.ParentHash[:])                                  // [0..32]
-	fix.Write(h.Coinbase[:])                                    // [32..52]
-	fix.Write(h.Root[:])                                        // [52..84]
-	fix.Write(h.ReceiptHash[:])                                 // [84..116]
-	fix.Write(h.Bloom[:])                                       // [116..372]
-	fix.Write(h.MixDigest[:])                                   // [372..404]
+	fix.Write(h.ParentHash[:])                                 // [0..32]
+	fix.Write(h.Coinbase[:])                                   // [32..52]
+	fix.Write(h.Root[:])                                       // [52..84]
+	fix.Write(h.ReceiptHash[:])                                // [84..116]
+	fix.Write(h.Bloom[:])                                      // [116..372]
+	fix.Write(h.MixDigest[:])                                  // [372..404]
 	binary.Write(&fix, binary.LittleEndian, h.Number.Uint64()) // [404..412]
 	binary.Write(&fix, binary.LittleEndian, h.GasLimit)        // [412..420]
 	binary.Write(&fix, binary.LittleEndian, h.GasUsed)         // [420..428]
@@ -127,9 +127,9 @@ func encodeExecutionPayloadFromBlock(block *types.Block, balBytes []byte) ([]byt
 	if h.ExcessBlobGas != nil {
 		excessBlobGas = *h.ExcessBlobGas
 	}
-	binary.Write(&fix, binary.LittleEndian, blobGasUsed)    // [512..520]
-	binary.Write(&fix, binary.LittleEndian, excessBlobGas)  // [520..528]
-	writeU32LE(&fix, balOff)                                 // [528..532]
+	binary.Write(&fix, binary.LittleEndian, blobGasUsed)   // [512..520]
+	binary.Write(&fix, binary.LittleEndian, excessBlobGas) // [520..528]
+	writeU32LE(&fix, balOff)                               // [528..532]
 	slotNumber := uint64(0)
 	if h.SlotNumber != nil {
 		slotNumber = *h.SlotNumber

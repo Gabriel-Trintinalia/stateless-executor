@@ -114,13 +114,14 @@ func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
 // encodeSszStatelessInput serialises SszStatelessInput (v0.4.1).
 //
 // Layout:
-//   [0..2]   schema_id (big-endian 0x0001) — outside the container
-//   --- SszStatelessInput container (all 4 fields variable) ---
-//   [0..4]   offset → new_payload_request
-//   [4..8]   offset → witness
-//   [8..12]  offset → chain_config
-//   [12..16] offset → public_keys
-//   [16..]   variable section, in order: npr, witness, chain_config, public_keys
+//
+//	[0..2]   schema_id (big-endian 0x0001) — outside the container
+//	--- SszStatelessInput container (all 4 fields variable) ---
+//	[0..4]   offset → new_payload_request
+//	[4..8]   offset → witness
+//	[8..12]  offset → chain_config
+//	[12..16] offset → public_keys
+//	[16..]   variable section, in order: npr, witness, chain_config, public_keys
 //
 // public_keys is SszList[ByteVector[65], MAX_PUBLIC_KEYS] — fixed-size 65-byte
 // elements packed back-to-back. We always emit zero public keys (no pre-
@@ -221,21 +222,21 @@ func encodeSszExecutionPayload(f *FixtureFile, txs types.Transactions, withdrawa
 	balOff := wdsOff + uint32(len(wdsSSZ))
 
 	var fix bytes.Buffer
-	fix.Write(mustHexToBytes(h.ParentHash))          // [0..32]
-	writeAddress(&fix, h.Beneficiary)                // [32..52]
-	fix.Write(mustHexToBytes(h.StateRoot))            // [52..84]
-	fix.Write(mustHexToBytes(h.ReceiptsRoot))         // [84..116]
-	writeBloom(&fix, h.LogsBloom)                     // [116..372]
-	fix.Write(mustHexToBytes(h.MixHash))              // [372..404]
-	binary.Write(&fix, binary.LittleEndian, h.Number) // [404..412]
-	binary.Write(&fix, binary.LittleEndian, h.GasLimit) // [412..420]
-	binary.Write(&fix, binary.LittleEndian, h.GasUsed)  // [420..428]
+	fix.Write(mustHexToBytes(h.ParentHash))              // [0..32]
+	writeAddress(&fix, h.Beneficiary)                    // [32..52]
+	fix.Write(mustHexToBytes(h.StateRoot))               // [52..84]
+	fix.Write(mustHexToBytes(h.ReceiptsRoot))            // [84..116]
+	writeBloom(&fix, h.LogsBloom)                        // [116..372]
+	fix.Write(mustHexToBytes(h.MixHash))                 // [372..404]
+	binary.Write(&fix, binary.LittleEndian, h.Number)    // [404..412]
+	binary.Write(&fix, binary.LittleEndian, h.GasLimit)  // [412..420]
+	binary.Write(&fix, binary.LittleEndian, h.GasUsed)   // [420..428]
 	binary.Write(&fix, binary.LittleEndian, h.Timestamp) // [428..436]
-	writeU32LE(&fix, extraDataOff)                    // [436..440]
-	fix.Write(sszUint256(baseFee))                    // [440..472]
-	fix.Write(make([]byte, 32))                        // [472..504] block_hash (zeros — unused for execution)
-	writeU32LE(&fix, txsOff)                          // [504..508]
-	writeU32LE(&fix, wdsOff)                          // [508..512]
+	writeU32LE(&fix, extraDataOff)                       // [436..440]
+	fix.Write(sszUint256(baseFee))                       // [440..472]
+	fix.Write(make([]byte, 32))                          // [472..504] block_hash (zeros — unused for execution)
+	writeU32LE(&fix, txsOff)                             // [504..508]
+	writeU32LE(&fix, wdsOff)                             // [508..512]
 	blobGasUsed := uint64(0)
 	if h.BlobGasUsed != nil {
 		blobGasUsed = *h.BlobGasUsed
@@ -251,7 +252,7 @@ func encodeSszExecutionPayload(f *FixtureFile, txs types.Transactions, withdrawa
 	if h.SlotNumber != nil {
 		slotNumber = *h.SlotNumber
 	}
-	binary.Write(&fix, binary.LittleEndian, slotNumber)    // [532..540] slot_number (0 = absent)
+	binary.Write(&fix, binary.LittleEndian, slotNumber) // [532..540] slot_number (0 = absent)
 
 	var out bytes.Buffer
 	out.Write(fix.Bytes())
