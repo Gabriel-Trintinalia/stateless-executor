@@ -103,7 +103,7 @@ func main() {
 		case blockNum := <-p.Heads:
 			metrics.BlockHeight.Set(float64(blockNum))
 			log.Printf("")
-		log.Printf("──────────────────────────────── block #%d ────────────────────────────────", blockNum)
+			log.Printf("──────────────────────────────── block #%d ────────────────────────────────", blockNum)
 
 			fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
 			input, elNode, meta, err := pipeline.Fetch(fetchCtx, p, blockNum, genesis, verbose, engineURL, jwtSecretFile)

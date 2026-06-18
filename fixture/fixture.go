@@ -44,28 +44,28 @@ type WitnessData struct {
 // plain JSON integer OR a 0x-hex string are captured as json.RawMessage and
 // decoded lazily by hexOrIntToUint64 / hexOrIntToBigInt.
 type FixtureHeader struct {
-	ParentHash            string           `json:"parent_hash"`
-	OmmersHash            string           `json:"ommers_hash"`
-	Beneficiary           string           `json:"beneficiary"`
-	StateRoot             string           `json:"state_root"`
-	TransactionsRoot      string           `json:"transactions_root"`
-	ReceiptsRoot          string           `json:"receipts_root"`
-	WithdrawalsRoot       *string          `json:"withdrawals_root"`
-	LogsBloom             string           `json:"logs_bloom"`
-	Difficulty            string           `json:"difficulty"` // always hex string "0x..."
-	Number                uint64           `json:"number"`
-	GasLimit              uint64           `json:"gas_limit"`
-	GasUsed               uint64           `json:"gas_used"`
-	Timestamp             uint64           `json:"timestamp"`
-	MixHash               string           `json:"mix_hash"`
-	Nonce                 string           `json:"nonce"`             // hex "0x0000000000000000"
-	BaseFeePerGas         json.RawMessage  `json:"base_fee_per_gas"` // int or "0x..." hex
-	BlobGasUsed           *uint64          `json:"blob_gas_used"`
-	ExcessBlobGas         *uint64          `json:"excess_blob_gas"`
-	ParentBeaconBlockRoot *string          `json:"parent_beacon_block_root"`
-	RequestsHash          *string          `json:"requests_hash"`
-	SlotNumber            *uint64          `json:"slot_number"`
-	ExtraData             string           `json:"extra_data"`
+	ParentHash            string          `json:"parent_hash"`
+	OmmersHash            string          `json:"ommers_hash"`
+	Beneficiary           string          `json:"beneficiary"`
+	StateRoot             string          `json:"state_root"`
+	TransactionsRoot      string          `json:"transactions_root"`
+	ReceiptsRoot          string          `json:"receipts_root"`
+	WithdrawalsRoot       *string         `json:"withdrawals_root"`
+	LogsBloom             string          `json:"logs_bloom"`
+	Difficulty            string          `json:"difficulty"` // always hex string "0x..."
+	Number                uint64          `json:"number"`
+	GasLimit              uint64          `json:"gas_limit"`
+	GasUsed               uint64          `json:"gas_used"`
+	Timestamp             uint64          `json:"timestamp"`
+	MixHash               string          `json:"mix_hash"`
+	Nonce                 string          `json:"nonce"`            // hex "0x0000000000000000"
+	BaseFeePerGas         json.RawMessage `json:"base_fee_per_gas"` // int or "0x..." hex
+	BlobGasUsed           *uint64         `json:"blob_gas_used"`
+	ExcessBlobGas         *uint64         `json:"excess_blob_gas"`
+	ParentBeaconBlockRoot *string         `json:"parent_beacon_block_root"`
+	RequestsHash          *string         `json:"requests_hash"`
+	SlotNumber            *uint64         `json:"slot_number"`
+	ExtraData             string          `json:"extra_data"`
 }
 
 // FixtureBody holds the block body (transactions, ommers, withdrawals).
@@ -78,8 +78,8 @@ type FixtureBody struct {
 
 // FixtureTx wraps a signature and a discriminated-union transaction.
 type FixtureTx struct {
-	Signature   FixtureSig                        `json:"signature"`
-	Transaction map[string]json.RawMessage        `json:"transaction"` // key = type name
+	Signature   FixtureSig                 `json:"signature"`
+	Transaction map[string]json.RawMessage `json:"transaction"` // key = type name
 }
 
 // FixtureSig holds the ECDSA signature components.
@@ -153,16 +153,16 @@ type Eip2930TxBody struct {
 
 // Eip7702TxBody: snake_case, numeric fields as ints.
 type Eip7702TxBody struct {
-	ChainID              uint64              `json:"chain_id"`
-	Nonce                uint64              `json:"nonce"`
-	GasLimit             uint64              `json:"gas_limit"`
-	MaxFeePerGas         uint64              `json:"max_fee_per_gas"`
-	MaxPriorityFeePerGas uint64              `json:"max_priority_fee_per_gas"`
-	To                   string              `json:"to"`
-	Value                string              `json:"value"`
-	AccessList           json.RawMessage     `json:"access_list"`
+	ChainID              uint64                 `json:"chain_id"`
+	Nonce                uint64                 `json:"nonce"`
+	GasLimit             uint64                 `json:"gas_limit"`
+	MaxFeePerGas         uint64                 `json:"max_fee_per_gas"`
+	MaxPriorityFeePerGas uint64                 `json:"max_priority_fee_per_gas"`
+	To                   string                 `json:"to"`
+	Value                string                 `json:"value"`
+	AccessList           json.RawMessage        `json:"access_list"`
 	AuthorizationList    []FixtureAuthorization `json:"authorization_list"`
-	Input                string              `json:"input"`
+	Input                string                 `json:"input"`
 }
 
 // FixtureAuthorization is an EIP-7702 authorization tuple.
@@ -244,4 +244,3 @@ func LoadZkevmFile(path string) ([]*ZkevmTestCase, error) {
 	}
 	return out, nil
 }
-

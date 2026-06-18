@@ -420,25 +420,25 @@ func printSummary(good []BlockResult, total, validationFailures int, target stri
 // ── HTML report ───────────────────────────────────────────────────────────────
 
 type reportData struct {
-	Generated        string
-	Target           string
-	Total            int
-	Good             int
-	Failed           int
-	ValidationFailed int
-	StatRows         []statRow
-	Labels           template.JS
+	Generated         string
+	Target            string
+	Total             int
+	Good              int
+	Failed            int
+	ValidationFailed  int
+	StatRows          []statRow
+	Labels            template.JS
 	ElapsedMs         template.JS // outer wall-clock ms per block (both targets)
 	InstructionCounts template.JS // retired instruction count per block (OpenVM only)
-	TotalCosts       template.JS // ZisK only
-	BaseCosts        template.JS
-	MainCosts        template.JS
-	OpCosts          template.JS
-	PreCosts         template.JS
-	MemCosts         template.JS
-	ExecFailed       []execFailedRow
-	ValidationFails  []validationFailRow
-	Errors           []errorRow
+	TotalCosts        template.JS // ZisK only
+	BaseCosts         template.JS
+	MainCosts         template.JS
+	OpCosts           template.JS
+	PreCosts          template.JS
+	MemCosts          template.JS
+	ExecFailed        []execFailedRow
+	ValidationFails   []validationFailRow
+	Errors            []errorRow
 }
 
 type execFailedRow struct {
@@ -569,25 +569,25 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 	sort.Slice(errRows, func(i, j int) bool { return errRows[i].BlockNum < errRows[j].BlockNum })
 
 	data := reportData{
-		Generated:        time.Now().Format(time.RFC1123),
-		Target:           target,
-		Total:            total,
-		Good:             len(good),
-		Failed:           len(execFailedRows),
-		ValidationFailed: len(validationFailRows),
-		StatRows:         statRows,
+		Generated:         time.Now().Format(time.RFC1123),
+		Target:            target,
+		Total:             total,
+		Good:              len(good),
+		Failed:            len(execFailedRows),
+		ValidationFailed:  len(validationFailRows),
+		StatRows:          statRows,
 		Labels:            toJS(blockNums),
 		ElapsedMs:         toJS(elapsedMs),
 		InstructionCounts: toJS(instructionCounts),
-		TotalCosts:       toJS(extract(func(c CostReport) uint64 { return c.Total })),
-		BaseCosts:        toJS(extract(func(c CostReport) uint64 { return c.Base })),
-		MainCosts:        toJS(extract(func(c CostReport) uint64 { return c.Main })),
-		OpCosts:          toJS(extract(func(c CostReport) uint64 { return c.Opcodes })),
-		PreCosts:         toJS(extract(func(c CostReport) uint64 { return c.Precompiles })),
-		MemCosts:         toJS(extract(func(c CostReport) uint64 { return c.Memory })),
-		ExecFailed:       execFailedRows,
-		ValidationFails:  validationFailRows,
-		Errors:           errRows,
+		TotalCosts:        toJS(extract(func(c CostReport) uint64 { return c.Total })),
+		BaseCosts:         toJS(extract(func(c CostReport) uint64 { return c.Base })),
+		MainCosts:         toJS(extract(func(c CostReport) uint64 { return c.Main })),
+		OpCosts:           toJS(extract(func(c CostReport) uint64 { return c.Opcodes })),
+		PreCosts:          toJS(extract(func(c CostReport) uint64 { return c.Precompiles })),
+		MemCosts:          toJS(extract(func(c CostReport) uint64 { return c.Memory })),
+		ExecFailed:        execFailedRows,
+		ValidationFails:   validationFailRows,
+		Errors:            errRows,
 	}
 
 	f, err := os.Create(path)

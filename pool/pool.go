@@ -21,10 +21,10 @@ import (
 )
 
 const (
-	pollInterval  = 500 * time.Millisecond
-	probeTimeout  = 10 * time.Second
-	rpcTimeout    = 5 * time.Second
-	probeRetryMax = 60               // max probe attempts before giving up
+	pollInterval   = 500 * time.Millisecond
+	probeTimeout   = 10 * time.Second
+	rpcTimeout     = 5 * time.Second
+	probeRetryMax  = 60              // max probe attempts before giving up
 	probeRetryWait = 5 * time.Second // wait between retries
 )
 
@@ -47,12 +47,12 @@ type rpcError struct {
 
 // Pool holds healthy EL nodes and exposes a channel of new block numbers.
 type Pool struct {
-	mu      sync.RWMutex
-	nodes   []string // healthy RPC URLs
-	robin   atomic.Uint64
-	Heads   chan uint64 // emits a block number each time a new head is seen
-	seen    uint64
-	client  *http.Client
+	mu     sync.RWMutex
+	nodes  []string // healthy RPC URLs
+	robin  atomic.Uint64
+	Heads  chan uint64 // emits a block number each time a new head is seen
+	seen   uint64
+	client *http.Client
 }
 
 // New probes each URL and returns a Pool containing only responsive nodes.
@@ -149,7 +149,6 @@ func (p *Pool) next() string {
 func (p *Pool) Pick() string {
 	return p.next()
 }
-
 
 // probe calls debug_executionWitness on "latest" and returns true if supported.
 func probe(url string) bool {

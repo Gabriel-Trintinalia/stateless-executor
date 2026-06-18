@@ -129,7 +129,6 @@ func (g *GenesisChainConfig) SszChainConfig(blockTimestamp uint64) []byte {
 	return nil
 }
 
-
 // buildSszChainConfig encodes SszChainConfig for a single active fork with one
 // blob schedule entry. Layout mirrors sszChainConfigAmsterdamMainnet — see
 // encode_ssz.go for the byte-by-byte commentary.
