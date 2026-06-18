@@ -20,9 +20,22 @@ type FixtureFile struct {
 
 // StatelessInput holds the decoded block and execution witness.
 type StatelessInput struct {
-	Block   FixtureBlock `json:"block"`
-	Witness WitnessData  `json:"witness"`
-	// chain_config intentionally skipped; not needed for zesu input
+	Block       FixtureBlock        `json:"block"`
+	Witness     WitnessData         `json:"witness"`
+	ChainConfig *FixtureChainConfig `json:"chain_config,omitempty"`
+}
+
+// FixtureChainConfig holds the fork activation timestamps needed to derive
+// the active fork index for the SszChainConfig field.
+type FixtureChainConfig struct {
+	ChainID       uint64  `json:"chain_id"`
+	OsakaTime     *uint64 `json:"osaka_time"`
+	Bpo1Time      *uint64 `json:"bpo1_time"`
+	Bpo2Time      *uint64 `json:"bpo2_time"`
+	Bpo3Time      *uint64 `json:"bpo3_time"`
+	Bpo4Time      *uint64 `json:"bpo4_time"`
+	Bpo5Time      *uint64 `json:"bpo5_time"`
+	AmsterdamTime *uint64 `json:"amsterdam_time"`
 }
 
 // FixtureBlock holds the decoded header + body.

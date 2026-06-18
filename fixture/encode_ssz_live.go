@@ -31,7 +31,7 @@ func encodeStatelessInputFromBlock(block *types.Block, state, codes, headers [][
 	}
 	wit := encodeExecutionWitnessFromArrays(state, codes, headers)
 	if chainCfg == nil {
-		chainCfg = sszChainConfigAmsterdamMainnet[:]
+		chainCfg = sszChainConfigAmsterdamMainnet
 	}
 	var pubKeys []byte // empty packed ByteVector[65] list — no pre-recovered sigs on live path
 
