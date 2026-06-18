@@ -9,15 +9,15 @@ import (
 // Result is one block verification result stored in the ring buffer
 // and served by GET /results.
 type Result struct {
-	Block         uint64 `json:"block"`
-	Guest         string `json:"guest"`
-	WitnessFrom   string `json:"witness_from"`
-	Valid         bool   `json:"valid"`
-	Error         string `json:"error,omitempty"`
-	Log           string `json:"log,omitempty"`
-	TxCount       int    `json:"tx_count"`
-	GasUsed       uint64 `json:"gas_used"`
-	DurationMs    int64  `json:"duration_ms"`
+	Block       uint64 `json:"block"`
+	Guest       string `json:"guest"`
+	WitnessFrom string `json:"witness_from"`
+	Valid       bool   `json:"valid"`
+	Error       string `json:"error,omitempty"`
+	Log         string `json:"log,omitempty"`
+	TxCount     int    `json:"tx_count"`
+	GasUsed     uint64 `json:"gas_used"`
+	DurationMs  int64  `json:"duration_ms"`
 }
 
 const capacity = 1000
@@ -60,4 +60,3 @@ func (r *RingBuffer) Handler() http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(r.All())
 	}
 }
-
