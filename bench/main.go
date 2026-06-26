@@ -9,6 +9,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"html/template"
@@ -52,6 +53,15 @@ type BlockResult struct {
 	Elapsed         time.Duration
 	ExpectedSuccess bool
 	ValidationOK    bool
+	// Block characteristics for correlation analysis.
+	TxCount     int
+	GasUsed     uint64
+	LegacyTxs   int
+	Eip1559Txs  int
+	Eip2930Txs  int
+	Eip4844Txs  int
+	Eip7702Txs  int
+	OutputHex string
 }
 
 var blockNumRe = regexp.MustCompile(`block_(\d+)`)
@@ -63,6 +73,7 @@ func main() {
 	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM)")
 	jobs := flag.Int("jobs", 1, "number of parallel emulator runs")
 	reportPath := flag.String("report", "bench_report.html", "output HTML report path")
+	csvPath := flag.String("csv", "", "optional path to write per-block CSV (block_num,tx_count,gas_used,legacy,eip1559,eip2930,eip4844,eip7702,base,main,opcodes,precompiles,memory,total,elapsed_ms)")
 	flag.Parse()
 
 	if *fixturesDir == "" || *elfPath == "" {
@@ -92,15 +103,16 @@ func main() {
 	}
 	log.Printf("found %d fixtures, running with %s/%s (%d job(s))...", len(paths), *targetFlag, *zkvmPath, *jobs)
 
-	var runBench func(fixturePath string) (CostReport, string, string, error, bool)
+	var runBench func(fixturePath string) (CostReport, string, string, error, bool, blockInfo)
 	if *targetFlag == "openvm" {
 		ep, zp := *elfPath, *zkvmPath
-		runBench = func(p string) (CostReport, string, string, error, bool) {
-			return benchOneOpenVM(p, ep, zp)
+		runBench = func(p string) (CostReport, string, string, error, bool, blockInfo) {
+			costs, execErr, out, err, ok := benchOneOpenVM(p, ep, zp)
+			return costs, execErr, out, err, ok, blockInfo{}
 		}
 	} else {
 		ep, zp := *elfPath, *zkvmPath
-		runBench = func(p string) (CostReport, string, string, error, bool) {
+		runBench = func(p string) (CostReport, string, string, error, bool, blockInfo) {
 			return benchOne(p, ep, zp)
 		}
 	}
@@ -120,7 +132,7 @@ func main() {
 			name := strings.TrimSuffix(filepath.Base(path), ".json")
 			blockNum := extractBlockNum(name)
 			t := time.Now()
-			costs, execErr, errOut, runErr, expectedSuccess := runBench(path)
+			costs, execErr, errOut, runErr, expectedSuccess, bi := runBench(path)
 			elapsed := time.Since(t)
 			gotSuccess := runErr == nil && execErr == ""
 			validationOK := runErr == nil && gotSuccess == expectedSuccess
@@ -157,6 +169,14 @@ func main() {
 				Elapsed:         elapsed,
 				ExpectedSuccess: expectedSuccess,
 				ValidationOK:    validationOK,
+				TxCount:         bi.TxCount,
+				GasUsed:         bi.GasUsed,
+				LegacyTxs:       bi.LegacyTxs,
+				Eip1559Txs:      bi.Eip1559Txs,
+				Eip2930Txs:      bi.Eip2930Txs,
+				Eip4844Txs:      bi.Eip4844Txs,
+				Eip7702Txs:      bi.Eip7702Txs,
+				OutputHex:       bi.OutputHex,
 			}
 		}(i, p)
 	}
@@ -187,46 +207,131 @@ func main() {
 		log.Fatalf("write report: %v", err)
 	}
 	log.Printf("report written to %s", *reportPath)
+
+	if *csvPath != "" {
+		if err := writeCSV(*csvPath, good); err != nil {
+			log.Fatalf("write csv: %v", err)
+		}
+		log.Printf("csv written to %s", *csvPath)
+	}
 }
 
-// benchOne returns (costs, execError, rawOutput, error, expectedSuccess) for a ZisK run.
-func benchOne(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool) {
+// blockInfo carries per-block characteristics extracted from the fixture.
+type blockInfo struct {
+	TxCount    int
+	GasUsed    uint64
+	LegacyTxs  int
+	Eip1559Txs int
+	Eip2930Txs int
+	Eip4844Txs int
+	Eip7702Txs int
+	OutputHex  string
+}
+
+func writeCSV(path string, results []BlockResult) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fmt.Fprintln(f, "block_num,tx_count,gas_used,legacy,eip1559,eip2930,eip4844,eip7702,base,main,opcodes,precompiles,memory,total,elapsed_ms")
+	for _, r := range results {
+		fmt.Fprintf(f, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+			r.BlockNum,
+			r.TxCount,
+			r.GasUsed,
+			r.LegacyTxs,
+			r.Eip1559Txs,
+			r.Eip2930Txs,
+			r.Eip4844Txs,
+			r.Eip7702Txs,
+			r.Costs.Base,
+			r.Costs.Main,
+			r.Costs.Opcodes,
+			r.Costs.Precompiles,
+			r.Costs.Memory,
+			r.Costs.Total,
+			r.Elapsed.Milliseconds(),
+		)
+	}
+	return nil
+}
+
+// benchOne returns (costs, execError, rawOutput, error, expectedSuccess, blockInfo) for a ZisK run.
+func benchOne(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool, blockInfo) {
 	f, err := fixture.LoadFile(fixturePath)
 	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false
+		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false, blockInfo{}
 	}
+
+	bi := extractBlockInfo(f)
 
 	input, err := fixture.ZesuInputSSZ(f)
 	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success
+		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success, bi
 	}
 
 	tmp, err := os.CreateTemp("", "zesu-bench-*.bin")
 	if err != nil {
-		return CostReport{}, "", "", err, f.Success
+		return CostReport{}, "", "", err, f.Success, bi
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(input); err != nil {
 		tmp.Close()
-		return CostReport{}, "", "", err, f.Success
+		return CostReport{}, "", "", err, f.Success, bi
 	}
 	if err := tmp.Close(); err != nil {
-		return CostReport{}, "", "", err, f.Success
+		return CostReport{}, "", "", err, f.Success, bi
 	}
 
-	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmp.Name()).
+	outFile, err := os.CreateTemp("", "zesu-bench-out-*.bin")
+	if err != nil {
+		return CostReport{}, "", "", err, f.Success, bi
+	}
+	outPath := outFile.Name()
+	outFile.Close()
+	defer os.Remove(outPath)
+
+	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmp.Name(), "-o", outPath).
 		CombinedOutput()
 	rawOut := strings.TrimSpace(string(out))
 	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("zkvm: %w", err), f.Success
+		return CostReport{}, "", rawOut, fmt.Errorf("zkvm: %w", err), f.Success, bi
 	}
 
 	costs, ok := parseCostReport(rawOut)
 	if !ok {
-		return CostReport{}, "", rawOut, fmt.Errorf("no COST DISTRIBUTION in ziskemu output"), f.Success
+		return CostReport{}, "", rawOut, fmt.Errorf("no COST DISTRIBUTION in ziskemu output"), f.Success, bi
 	}
 	execErr := parseExecError(rawOut)
-	return costs, execErr, rawOut, nil, f.Success
+
+	if outBytes, err2 := os.ReadFile(outPath); err2 == nil {
+		bi.OutputHex = hex.EncodeToString(outBytes)
+	}
+
+	return costs, execErr, rawOut, nil, f.Success, bi
+}
+
+func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
+	bi := blockInfo{}
+	txs := f.StatelessInput.Block.Body.Transactions
+	bi.TxCount = len(txs)
+	for _, tx := range txs {
+		switch {
+		case tx.Transaction["eip1559"] != nil:
+			bi.Eip1559Txs++
+		case tx.Transaction["eip4844"] != nil:
+			bi.Eip4844Txs++
+		case tx.Transaction["eip2930"] != nil:
+			bi.Eip2930Txs++
+		case tx.Transaction["eip7702"] != nil:
+			bi.Eip7702Txs++
+		default:
+			bi.LegacyTxs++
+		}
+	}
+	bi.GasUsed = f.StatelessInput.Block.Header.GasUsed
+	return bi
 }
 
 // benchOneOpenVM returns (costs, execError, rawOutput, error, expectedSuccess) for an OpenVM run.
@@ -439,6 +544,22 @@ type reportData struct {
 	ExecFailed        []execFailedRow
 	ValidationFails   []validationFailRow
 	Errors            []errorRow
+	RawBlocks         []rawBlockRow
+}
+
+type rawBlockRow struct {
+	BlockNum       uint64
+	TxCount        int
+	GasUsed        uint64
+	Base           uint64
+	Main           uint64
+	Opcodes        uint64
+	Precompiles    uint64
+	Memory         uint64
+	Total          uint64
+	PayloadRoot    string // hex of out[0:32]: new_payload_request_root
+	Success        bool   // out[32]: 0x01 = valid
+	ChainConfigHex string // hex of out[33:105]: SszChainConfig
 }
 
 type execFailedRow struct {
@@ -568,6 +689,27 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 	}
 	sort.Slice(errRows, func(i, j int) bool { return errRows[i].BlockNum < errRows[j].BlockNum })
 
+	rawBlocks := make([]rawBlockRow, len(good))
+	for i, r := range good {
+		row := rawBlockRow{
+			BlockNum:    r.BlockNum,
+			TxCount:     r.TxCount,
+			GasUsed:     r.GasUsed,
+			Base:        r.Costs.Base,
+			Main:        r.Costs.Main,
+			Opcodes:     r.Costs.Opcodes,
+			Precompiles: r.Costs.Precompiles,
+			Memory:      r.Costs.Memory,
+			Total:       r.Costs.Total,
+		}
+		if b, err := hex.DecodeString(r.OutputHex); err == nil && len(b) >= 105 {
+			row.PayloadRoot = hex.EncodeToString(b[0:32])
+			row.Success = b[32] == 0x01
+			row.ChainConfigHex = hex.EncodeToString(b[33:105])
+		}
+		rawBlocks[i] = row
+	}
+
 	data := reportData{
 		Generated:         time.Now().Format(time.RFC1123),
 		Target:            target,
@@ -588,6 +730,7 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		ExecFailed:        execFailedRows,
 		ValidationFails:   validationFailRows,
 		Errors:            errRows,
+		RawBlocks:         rawBlocks,
 	}
 
 	f, err := os.Create(path)
@@ -624,6 +767,7 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   #execFailTable td:first-child { width: 10rem; }
   #errTable { max-width: 1100px; }
   #errTable td:first-child { font-family: monospace; width: 10rem; }
+  tr.row-fail { background: #fff0f0 !important; border-left: 3px solid #dc3545; }
 </style>
 </head>
 <body>
@@ -713,6 +857,48 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 </table>
 {{end}}
 
+{{if .RawBlocks}}
+<h2>Raw Block Data</h2>
+<input id="rawSearch" type="text" placeholder="Filter by block number..." style="margin-bottom:.5rem;padding:.3rem .6rem;font-size:.9rem;border:1px solid #dee2e6;border-radius:4px;width:220px">
+<label style="margin-left:.75rem;font-size:.9rem;cursor:pointer"><input type="checkbox" id="failOnly" style="margin-right:.3rem">Failures only</label>
+<div style="overflow-x:auto;max-width:100%">
+<table id="rawTable" style="font-size:.82rem;min-width:900px">
+  <thead>
+  <tr>
+    <th onclick="sortTable(0)" style="cursor:pointer;white-space:nowrap">Block ↕</th>
+    <th onclick="sortTable(1)" style="cursor:pointer">TxCount ↕</th>
+    <th onclick="sortTable(2)" style="cursor:pointer">GasUsed ↕</th>
+    <th onclick="sortTable(3)" style="cursor:pointer">Base ↕</th>
+    <th onclick="sortTable(4)" style="cursor:pointer">Main ↕</th>
+    <th onclick="sortTable(5)" style="cursor:pointer">Opcodes ↕</th>
+    <th onclick="sortTable(6)" style="cursor:pointer">Precompiles ↕</th>
+    <th onclick="sortTable(7)" style="cursor:pointer">Memory ↕</th>
+    <th onclick="sortTable(8)" style="cursor:pointer">Total ↕</th>
+    <th>Success</th>
+    <th>PayloadRoot</th>
+  </tr>
+  </thead>
+  <tbody id="rawBody">
+  {{range .RawBlocks}}
+  <tr{{if not .Success}} class="row-fail"{{end}}>
+    <td style="font-family:monospace">{{.BlockNum}}</td>
+    <td>{{.TxCount}}</td>
+    <td>{{.GasUsed}}</td>
+    <td>{{.Base}}</td>
+    <td>{{.Main}}</td>
+    <td>{{.Opcodes}}</td>
+    <td>{{.Precompiles}}</td>
+    <td>{{.Memory}}</td>
+    <td>{{.Total}}</td>
+    <td style="text-align:center">{{if .Success}}<span style="color:#198754">✓</span>{{else}}<span style="color:#dc3545">✗</span>{{end}}</td>
+    <td style="font-family:monospace;font-size:.72rem;white-space:nowrap" title="{{.PayloadRoot}}">0x{{.PayloadRoot}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+
 <script>
 const labels             = {{.Labels}};
 const elapsedMs          = {{.ElapsedMs}};
@@ -775,6 +961,37 @@ new Chart(document.getElementById('elapsedChart'), {
     }
   }
 });
+
+let sortDir = {};
+function sortTable(col) {
+  const tbody = document.getElementById('rawBody');
+  if (!tbody) return;
+  const rows = Array.from(tbody.rows);
+  const asc = !sortDir[col];
+  sortDir = {};
+  sortDir[col] = asc;
+  rows.sort((a, b) => {
+    const av = a.cells[col].textContent.trim();
+    const bv = b.cells[col].textContent.trim();
+    const an = parseFloat(av.replace(/,/g,'')), bn = parseFloat(bv.replace(/,/g,''));
+    if (!isNaN(an) && !isNaN(bn)) return asc ? an - bn : bn - an;
+    return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+  });
+  rows.forEach(r => tbody.appendChild(r));
+}
+const rawSearch = document.getElementById('rawSearch');
+const failOnly = document.getElementById('failOnly');
+function applyRawFilters() {
+  const q = rawSearch ? rawSearch.value.trim() : '';
+  const fo = failOnly ? failOnly.checked : false;
+  Array.from(document.getElementById('rawBody').rows).forEach(r => {
+    const blockMatch = r.cells[0].textContent.includes(q);
+    const failMatch = !fo || r.classList.contains('row-fail');
+    r.style.display = (blockMatch && failMatch) ? '' : 'none';
+  });
+}
+if (rawSearch) rawSearch.addEventListener('input', applyRawFilters);
+if (failOnly) failOnly.addEventListener('change', applyRawFilters);
 
 {{if eq .Target "zisk"}}
 new Chart(document.getElementById('totalChart'), {
