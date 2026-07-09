@@ -11,26 +11,22 @@ import (
 // and blob-schedule key. Ordered from oldest to newest so the active-fork
 // search can walk backwards and stop at the first activated entry.
 //
-// Enum indices match tuple(ProtocolFork) in stateless_ssz.py (Amsterdam spec):
+// Enum indices match tuple(ProtocolFork) in stateless_ssz.py (glamsterdam-devnet-6 / zkevm@v0.5.0):
+// PR#2926 merged ConstantinopleFix into StPetersburg and removed BPO3-5,
+// shifting all indices from 7 onwards by -1 vs v0.4.1.
 //
-//	Cancun=16 Prague=17 Osaka=18 BPO1=19 … BPO5=23 Amsterdam=24
+//	Cancun=15 Prague=16 Osaka=17 BPO1=18 BPO2=19 Amsterdam=20
 var forkDefs = []struct {
 	timeField string // genesis config key (e.g. "cancunTime")
 	blobKey   string // blobSchedule map key (e.g. "cancun")
 	enumVal   uint64 // ProtocolFork SSZ index
 }{
-	{"cancunTime", "cancun", 16},
-	{"pragueTime", "prague", 17},
-	{"osakaTime", "osaka", 18},
-	// Note: some genesis generators omit amsterdamTime and set osakaTime as the
-	// latest fork. Where amsterdamTime is present it takes precedence via the
-	// enum ordering (24 > 18).
-	{"bpo1Time", "bpo1", 19},
-	{"bpo2Time", "bpo2", 20},
-	{"bpo3Time", "bpo3", 21},
-	{"bpo4Time", "bpo4", 22},
-	{"bpo5Time", "bpo5", 23},
-	{"amsterdamTime", "amsterdam", 24},
+	{"cancunTime", "cancun", 15},
+	{"pragueTime", "prague", 16},
+	{"osakaTime", "osaka", 17},
+	{"bpo1Time", "bpo1", 18},
+	{"bpo2Time", "bpo2", 19},
+	{"amsterdamTime", "amsterdam", 20},
 }
 
 // GenesisChainConfig holds the executor-relevant subset of a genesis.json.

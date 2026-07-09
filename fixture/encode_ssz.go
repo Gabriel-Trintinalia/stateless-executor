@@ -1,13 +1,13 @@
 package fixture
 
-// SSZ encoder for SszStatelessInput (bal-devnet-7 / zkevm@v0.4.1).
+// SSZ encoder for SszStatelessInput (glamsterdam-devnet-6 / zkevm@v0.5.0).
 //
 // Implements the container layout from stateless_ssz.py, matched to what
 // zesu's ssz.zig decoder expects. Key divergences from spec:
 //   - SszWithdrawal.amount encoded as uint64 (8 bytes), not uint256 (32 bytes)
 //   - base_fee_per_gas encoded as uint256 (32 bytes LE); zesu reads low 8 bytes only
 //
-// Stateless input bytes layout (v0.4.1):
+// Stateless input bytes layout (v0.5.0):
 //   [0..2]    schema_id (big-endian uint16, fixed at 0x0001)
 //   --- SszStatelessInput container ---
 //   [0..4]    offset → new_payload_request   (variable)
@@ -18,7 +18,7 @@ package fixture
 // SszChainConfig embeds the full active fork descriptor (fork enum,
 // activation timestamps, blob schedule). For mainnet/Amsterdam the body is
 // a 68-byte constant (sszChainConfigAmsterdamMainnet) — the only target of
-// the v0.4.1 zkevm fixtures.
+// the v0.5.0 zkevm fixtures.
 //
 // SszExecutionPayload fixed region (540 bytes): see encodeSszExecutionPayload.
 
@@ -32,56 +32,71 @@ import (
 )
 
 // statelessInputSchemaID is the 2-byte big-endian prefix on every
-// bal-devnet-7 / zkevm@v0.4.1 stateless input. See STATELESS_INPUT_SCHEMA_ID
+// glamsterdam-devnet-6 / zkevm@v0.5.0 stateless input. See STATELESS_INPUT_SCHEMA_ID
 // in stateless_ssz.py.
 const statelessInputSchemaID = uint16(0x0001)
 
-// activeForkIndex returns the ProtocolFork enum index (matching zesu's forkNameFromIndex)
-// that is active at the given block timestamp, using activation times from the fixture's
-// chain_config. Falls back to Amsterdam (24) when chain_config is absent.
+// activeForkInfo returns the ProtocolFork enum index and activation timestamp for the
+// fork active at blockTimestamp. Falls back to Amsterdam (20) when chain_config is absent.
+// activationTime is 0 when the activation timestamp is unknown (Prague fallback, nil cc) —
+// zesu decodes 0 as activation_timestamp=Some(0), which every block satisfies.
 //
-// Fork indices (from zesu ssz.zig):
+// Fork indices (zkevm@v0.5.0 — PR#2926: ConstantinopleFix merged into StPetersburg,
+// BPO3-BPO5 removed; all indices from 7 onwards shift by -1 vs v0.4.1):
 //
-//	18=Osaka, 19=BPO1, 20=BPO2, 21=BPO3, 22=BPO4, 23=BPO5, 24=Amsterdam
-func activeForkIndex(cc *FixtureChainConfig, blockTimestamp uint64) uint64 {
+//	16=Prague, 17=Osaka, 18=BPO1, 19=BPO2, 20=Amsterdam
+func activeForkInfo(cc *FixtureChainConfig, blockTimestamp uint64) (forkIdx uint64, activationTime uint64) {
 	if cc == nil {
-		return 24 // Amsterdam default
+		return 20, 0 // Amsterdam default, activation unknown
 	}
 	type forkEntry struct {
 		idx  uint64
 		time *uint64
 	}
 	forks := []forkEntry{
-		{24, cc.AmsterdamTime},
-		{23, cc.Bpo5Time},
-		{22, cc.Bpo4Time},
-		{21, cc.Bpo3Time},
-		{20, cc.Bpo2Time},
-		{19, cc.Bpo1Time},
-		{18, cc.OsakaTime},
+		{20, cc.AmsterdamTime},
+		{19, cc.Bpo2Time},
+		{18, cc.Bpo1Time},
+		{17, cc.OsakaTime},
 	}
 	for _, f := range forks {
 		if f.time != nil && blockTimestamp >= *f.time {
-			return f.idx
+			return f.idx, *f.time
 		}
 	}
-	return 17 // Prague fallback
+	return 16, 0 // Prague fallback, activation unknown
 }
 
-// buildFixtureSszChainConfig returns a minimal 20-byte SszChainConfig body that zesu's
-// ssz.zig decoder accepts. Zesu only reads chain_id and the fork enum index;
-// all other fields (activation timestamps, blob schedule) are unused by the decoder.
-func buildFixtureSszChainConfig(chainID uint64, forkIdx uint64) []byte {
-	buf := make([]byte, 20)
-	binary.LittleEndian.PutUint64(buf[0:8], chainID)   // chain_id
-	binary.LittleEndian.PutUint32(buf[8:12], 12)       // offset → active_fork = 12
-	binary.LittleEndian.PutUint64(buf[12:20], forkIdx) // active_fork.fork
-	return buf
+// buildFixtureSszChainConfig returns a 68-byte SszChainConfig matching the layout in
+// genesis.go's buildSszChainConfig. activationTime is encoded as a single-entry timestamp
+// list (block_number list is empty). Blob schedule fields are zeroed (zesu does not use
+// them for execution). activationTime=0 means "activated at genesis" — always satisfied.
+//
+// Layout (68 bytes):
+//
+//	SszChainConfig fixed (12 bytes): chain_id[0..8] + offset_active_fork[8..12]=12
+//	SszForkConfig  (56 bytes at offset 12):
+//	  fork[0..8] + offset_activation[8..12]=16 + offset_blob_sched[12..16]=32
+//	  SszForkActivation (16 bytes at offset 28):
+//	    bn_offset[0..4]=8 + ts_offset[4..8]=8 + timestamp[8..16]
+//	  SszBlobSchedule (24 bytes at offset 44): target=0, max=0, baseFee=0
+func buildFixtureSszChainConfig(chainID, forkIdx, activationTime uint64) []byte {
+	out := make([]byte, 68)
+	binary.LittleEndian.PutUint64(out[0:], chainID)
+	binary.LittleEndian.PutUint32(out[8:], 12)           // offset → active_fork
+	binary.LittleEndian.PutUint64(out[12:], forkIdx)     // fork enum
+	binary.LittleEndian.PutUint32(out[20:], 16)          // offset → activation (rel to fork_config)
+	binary.LittleEndian.PutUint32(out[24:], 32)          // offset → blob_schedule
+	binary.LittleEndian.PutUint32(out[28:], 8)           // bn_offset (empty block_number list)
+	binary.LittleEndian.PutUint32(out[32:], 8)           // ts_offset (block_number list empty)
+	binary.LittleEndian.PutUint64(out[36:], activationTime) // timestamp[0]
+	// blob schedule (out[44..68]): target=0, max=0, baseFee=0 (already zeroed)
+	return out
 }
 
 // sszChainConfigAmsterdamMainnet is a pre-built SszChainConfig for Amsterdam mainnet
-// (fork index 24, chain_id 1). Used as a fallback in the live pipeline.
-var sszChainConfigAmsterdamMainnet = buildFixtureSszChainConfig(1, 24)
+// (fork index 20, chain_id 1, activation unknown → 0). Used as a fallback in the live pipeline.
+var sszChainConfigAmsterdamMainnet = buildFixtureSszChainConfig(1, 20, 0)
 
 // ZesuInputSSZPlain encodes a fixture as a plain SSZ blob with no zisk framing.
 func ZesuInputSSZPlain(f *FixtureFile) ([]byte, error) {
@@ -126,7 +141,7 @@ func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// encodeSszStatelessInput serialises SszStatelessInput (v0.4.1).
+// encodeSszStatelessInput serialises SszStatelessInput (v0.5.0).
 //
 // Layout:
 //
@@ -150,12 +165,12 @@ func encodeSszStatelessInput(f *FixtureFile, txs types.Transactions, withdrawals
 	if err != nil {
 		return nil, err
 	}
-	forkIdx := activeForkIndex(f.StatelessInput.ChainConfig, f.StatelessInput.Block.Header.Timestamp)
+	forkIdx, activationTime := activeForkInfo(f.StatelessInput.ChainConfig, f.StatelessInput.Block.Header.Timestamp)
 	chainID := uint64(1)
 	if f.StatelessInput.ChainConfig != nil && f.StatelessInput.ChainConfig.ChainID != 0 {
 		chainID = f.StatelessInput.ChainConfig.ChainID
 	}
-	chainCfg := buildFixtureSszChainConfig(chainID, forkIdx)
+	chainCfg := buildFixtureSszChainConfig(chainID, forkIdx, activationTime)
 	var pubKeys []byte // empty packed ByteVector[65] list
 
 	// Fixed region: four uint32 offsets = 16 bytes.
