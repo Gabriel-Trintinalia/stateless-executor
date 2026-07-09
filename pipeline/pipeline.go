@@ -6,7 +6,7 @@
 //	[u64 LE: ssz_len] [SszStatelessInput bytes, padded to 8-byte boundary]
 //
 // SSZ schema: 2-byte big-endian schema_id (0x0001) followed by SszStatelessInput
-// as defined in stateless_ssz.py (zkevm@v0.4.1 / bal-devnet-7).
+// as defined in stateless_ssz.py (zkevm@v0.5.0 / glamsterdam-devnet-6).
 package pipeline
 
 import (

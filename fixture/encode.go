@@ -21,7 +21,7 @@ var ErrMissingStatelessInputBytes = errors.New("statelessInputBytes missing — 
 // ziskemu-ready binary input. Requires the fixture to carry pre-encoded SSZ
 // statelessInputBytes (Amsterdam+); pre-Amsterdam fixtures are unsupported.
 //
-// bal-devnet-7 / zkevm@v0.4.1: the fixture's statelessInputBytes already
+// glamsterdam-devnet-6 / zkevm@v0.5.0: the fixture's statelessInputBytes already
 // includes the 2-byte schema id and the full SszChainConfig (with active
 // fork descriptor), so no injection is needed — the runner just wraps the
 // raw bytes in the ziskemu length-prefixed framing.
