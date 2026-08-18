@@ -3,8 +3,9 @@
 //
 // Guest contract:
 //   - stdin:  raw SSZ SszStatelessInput (no framing)
-//   - stdout: binary SszStatelessValidationResult
-//     [0..32] new_payload_request_root, [32] successful_validation
+//   - stdout: binary SszStatelessValidationResult, a flat 43 bytes
+//     [0..32] new_payload_request_root, [32] successful_validation,
+//     [33..41] chain_id, [41..43] schema_id
 //   - stderr: informational (logged but not parsed)
 package runner
 
@@ -22,6 +23,10 @@ import (
 	"github.com/Gabriel-Trintinalia/stateless-executor/metrics"
 	"github.com/Gabriel-Trintinalia/stateless-executor/store"
 )
+
+// statelessOutputSize is the serialized size of SszStatelessValidationResult
+// (zkevm@v0.8.0): root(32) + successful_validation(1) + chain_id(8) + schema_id(2).
+const statelessOutputSize = 43
 
 // GuestSpec identifies a guest binary by name and filesystem path.
 type GuestSpec struct {
@@ -86,13 +91,14 @@ func Run(ctx context.Context, spec GuestSpec, input []byte, blockNum uint64) (st
 		return store.Result{Log: logOutput}, fmt.Errorf("runner [%s]: %w", spec.Name, err)
 	}
 
-	// SszStatelessValidationResult layout:
+	// SszStatelessValidationResult (zkevm@v0.8.0) — a flat 43 bytes:
 	//   [0..32]  new_payload_request_root (Bytes32)
 	//   [32]     successful_validation (boolean: 0x00 or 0x01)
-	//   [33..37] offset to chain_config (uint32 LE)
-	//   [37..]   chain_config SSZ bytes
+	//   [33..41] chain_id (uint64 LE)
+	//   [41..43] schema_id (uint16 LE)
+	// A rejected input yields 43 zero bytes (the default-failed output).
 	out := stdout.Bytes()
-	if len(out) < 33 {
+	if len(out) < statelessOutputSize {
 		metrics.BlockVerifiedTotal.WithLabelValues(spec.Name, "error").Inc()
 		metrics.VerificationDurationMs.WithLabelValues(spec.Name).Observe(float64(durationMs))
 		return store.Result{Log: logOutput}, fmt.Errorf("runner [%s]: output too short (%d bytes)", spec.Name, len(out))
