@@ -25,11 +25,16 @@ type StatelessInput struct {
 	ChainConfig *FixtureChainConfig `json:"chain_config,omitempty"`
 }
 
-// FixtureChainConfig holds the fork activation timestamps needed to derive
-// the active fork index for the SszChainConfig field.
-// zkevm@v0.5.0: BPO3-BPO5 were pruned from PROTOCOL_FORKS; BPO2 remains at index 19.
+// FixtureChainConfig holds the chain id and fork activation timestamps of a
+// fixture. zkevm@v0.8.0 dropped SszChainConfig from the stateless input: the
+// chain id is inlined, and the fork the block must be executed under is carried
+// by the schema id (see activeProtocolFork), so these timestamps decide which
+// schema id the input is stamped with.
 type FixtureChainConfig struct {
 	ChainID       uint64  `json:"chain_id"`
+	ShanghaiTime  *uint64 `json:"shanghai_time"`
+	CancunTime    *uint64 `json:"cancun_time"`
+	PragueTime    *uint64 `json:"prague_time"`
 	OsakaTime     *uint64 `json:"osaka_time"`
 	Bpo1Time      *uint64 `json:"bpo1_time"`
 	Bpo2Time      *uint64 `json:"bpo2_time"`

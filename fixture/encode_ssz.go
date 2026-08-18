@@ -1,24 +1,31 @@
 package fixture
 
-// SSZ encoder for SszStatelessInput (glamsterdam-devnet-6 / zkevm@v0.5.0).
+// SSZ encoder for SszStatelessInput (glamsterdam-devnet-8 / zkevm@v0.8.0).
 //
-// Implements the container layout from stateless_ssz.py, matched to what
-// zesu's ssz.zig decoder expects. Key divergences from spec:
-//   - SszWithdrawal.amount encoded as uint64 (8 bytes), not uint256 (32 bytes)
-//   - base_fee_per_gas encoded as uint256 (32 bytes LE); zesu reads low 8 bytes only
+// Implements the container layout from stateless_ssz.py, verified field by
+// field against the statelessInputBytes the reference emits in the
+// tests-zkevm@v0.8.0 fixtures: 44-byte withdrawals (amount is a uint64),
+// 32-byte little-endian base_fee_per_gas (zesu reads its low 8 bytes), and a
+// 540-byte SszExecutionPayload fixed region.
 //
-// Stateless input bytes layout (v0.5.0):
-//   [0..2]    schema_id (big-endian uint16, fixed at 0x0001)
-//   --- SszStatelessInput container ---
+// Stateless input bytes layout (v0.8.0):
+//   [0..2]    schema_id (big-endian uint16, fixed at 0x1501)
+//   --- SszStatelessInput container (20-byte fixed region) ---
 //   [0..4]    offset → new_payload_request   (variable)
 //   [4..8]    offset → witness               (variable)
-//   [8..12]   offset → chain_config          (variable; SszChainConfig)
-//   [12..16]  offset → public_keys           (variable; packed ByteVector[65])
+//   [8..16]   chain_id                       (uint64 LE, inline)
+//   [16..20]  offset → public_keys           (variable; packed ByteVector[65])
 //
-// SszChainConfig embeds the full active fork descriptor (fork enum,
-// activation timestamps, blob schedule). For mainnet/Amsterdam the body is
-// a 68-byte constant (sszChainConfigAmsterdamMainnet) — the only target of
-// the v0.5.0 zkevm fixtures.
+// v0.8.0 replaced the nested SszChainConfig — which carried the whole active
+// fork descriptor (fork enum, activation timestamps, blob schedule) — with a
+// bare inline chain_id, growing the fixed region from 16 to 20 bytes. The fork
+// is now pinned by the schema id itself (0x15 = ProtocolFork.Amsterdam, 0x01 =
+// schema revision), so no fork descriptor is encoded at all.
+//
+// The payload containers became EIP-7495 ProgressiveContainers and their lists
+// EIP-7916 ProgressiveLists, but those serialize identically to the stable
+// forms — only hash_tree_root changed, which is the guest's concern, not the
+// encoder's. Every container below is therefore unchanged from v0.5.0.
 //
 // SszExecutionPayload fixed region (540 bytes): see encodeSszExecutionPayload.
 
@@ -31,72 +38,58 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// statelessInputSchemaID is the 2-byte big-endian prefix on every
-// glamsterdam-devnet-6 / zkevm@v0.5.0 stateless input. See STATELESS_INPUT_SCHEMA_ID
-// in stateless_ssz.py.
-const statelessInputSchemaID = uint16(0x0001)
+// ProtocolFork indices, verbatim from the reference enum (execution-specs
+// src/ethereum/forks/amsterdam/stateless.py at tests-zkevm@v0.8.0). The
+// stateless input's schema id is `fork_index << 8 | revision`, so this is what
+// tells the guest which rules to execute the block under.
+const (
+	forkShanghai  = 0x0F
+	forkCancun    = 0x10
+	forkPrague    = 0x11
+	forkOsaka     = 0x12
+	forkBPO1      = 0x13
+	forkBPO2      = 0x14
+	forkAmsterdam = 0x15
+)
 
-// activeForkInfo returns the ProtocolFork enum index and activation timestamp for the
-// fork active at blockTimestamp. Falls back to Amsterdam (20) when chain_config is absent.
-// activationTime is 0 when the activation timestamp is unknown (Prague fallback, nil cc) —
-// zesu decodes 0 as activation_timestamp=Some(0), which every block satisfies.
-//
-// Fork indices (zkevm@v0.5.0 — PR#2926: ConstantinopleFix merged into StPetersburg,
-// BPO3-BPO5 removed; all indices from 7 onwards shift by -1 vs v0.4.1):
-//
-//	16=Prague, 17=Osaka, 18=BPO1, 19=BPO2, 20=Amsterdam
-func activeForkInfo(cc *FixtureChainConfig, blockTimestamp uint64) (forkIdx uint64, activationTime uint64) {
+// statelessInputSchemaRevision is the payload encoding revision: 0x01 is
+// SSZ encode(SszStatelessInput), the only revision defined.
+const statelessInputSchemaRevision = 0x01
+
+// statelessInputSchemaID is the Amsterdam schema id (0x1501) — what the
+// zkevm@v0.8.0 fixtures carry, and the default when no fork can be resolved.
+const statelessInputSchemaID = uint16(forkAmsterdam)<<8 | statelessInputSchemaRevision
+
+// schemaIDFor builds the 2-byte schema id for a ProtocolFork index.
+func schemaIDFor(fork uint8) uint16 {
+	return uint16(fork)<<8 | statelessInputSchemaRevision
+}
+
+// activeProtocolFork returns the ProtocolFork index active at blockTimestamp,
+// walking newest to oldest. Falls back to Amsterdam when the chain config is
+// absent or names no activated fork — matching the guest's own default.
+func activeProtocolFork(cc *FixtureChainConfig, blockTimestamp uint64) uint8 {
 	if cc == nil {
-		return 20, 0 // Amsterdam default, activation unknown
+		return forkAmsterdam
 	}
-	type forkEntry struct {
-		idx  uint64
+	for _, f := range []struct {
+		idx  uint8
 		time *uint64
-	}
-	forks := []forkEntry{
-		{20, cc.AmsterdamTime},
-		{19, cc.Bpo2Time},
-		{18, cc.Bpo1Time},
-		{17, cc.OsakaTime},
-	}
-	for _, f := range forks {
+	}{
+		{forkAmsterdam, cc.AmsterdamTime},
+		{forkBPO2, cc.Bpo2Time},
+		{forkBPO1, cc.Bpo1Time},
+		{forkOsaka, cc.OsakaTime},
+		{forkPrague, cc.PragueTime},
+		{forkCancun, cc.CancunTime},
+		{forkShanghai, cc.ShanghaiTime},
+	} {
 		if f.time != nil && blockTimestamp >= *f.time {
-			return f.idx, *f.time
+			return f.idx
 		}
 	}
-	return 16, 0 // Prague fallback, activation unknown
+	return forkAmsterdam
 }
-
-// buildFixtureSszChainConfig returns a 68-byte SszChainConfig matching the layout in
-// genesis.go's buildSszChainConfig. activationTime is encoded as a single-entry timestamp
-// list (block_number list is empty). Blob schedule fields are zeroed (zesu does not use
-// them for execution). activationTime=0 means "activated at genesis" — always satisfied.
-//
-// Layout (68 bytes):
-//
-//	SszChainConfig fixed (12 bytes): chain_id[0..8] + offset_active_fork[8..12]=12
-//	SszForkConfig  (56 bytes at offset 12):
-//	  fork[0..8] + offset_activation[8..12]=16 + offset_blob_sched[12..16]=32
-//	  SszForkActivation (16 bytes at offset 28):
-//	    bn_offset[0..4]=8 + ts_offset[4..8]=8 + timestamp[8..16]
-//	  SszBlobSchedule (24 bytes at offset 44): target=0, max=0, baseFee=0
-func buildFixtureSszChainConfig(chainID, forkIdx, activationTime uint64) []byte {
-	out := make([]byte, 68)
-	binary.LittleEndian.PutUint64(out[0:], chainID)
-	binary.LittleEndian.PutUint32(out[8:], 12)           // offset → active_fork
-	binary.LittleEndian.PutUint64(out[12:], forkIdx)     // fork enum
-	binary.LittleEndian.PutUint32(out[20:], 16)          // offset → activation (rel to fork_config)
-	binary.LittleEndian.PutUint32(out[24:], 32)          // offset → blob_schedule
-	binary.LittleEndian.PutUint32(out[28:], 8)           // bn_offset (empty block_number list)
-	binary.LittleEndian.PutUint32(out[32:], 8)           // ts_offset (block_number list empty)
-	binary.LittleEndian.PutUint64(out[36:], activationTime) // timestamp[0]
-	// blob schedule (out[44..68]): target=0, max=0, baseFee=0 (already zeroed)
-	return out
-}
-
-// sszChainConfigAmsterdamMainnet is a pre-built SszChainConfig for Amsterdam mainnet
-// (fork index 20, chain_id 1, activation unknown → 0). Used as a fallback in the live pipeline.
-var sszChainConfigAmsterdamMainnet = buildFixtureSszChainConfig(1, 20, 0)
 
 // ZesuInputSSZPlain encodes a fixture as a plain SSZ blob with no zisk framing.
 func ZesuInputSSZPlain(f *FixtureFile) ([]byte, error) {
@@ -141,17 +134,17 @@ func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// encodeSszStatelessInput serialises SszStatelessInput (v0.5.0).
+// encodeSszStatelessInput serialises SszStatelessInput (v0.8.0).
 //
 // Layout:
 //
-//	[0..2]   schema_id (big-endian 0x0001) — outside the container
-//	--- SszStatelessInput container (all 4 fields variable) ---
+//	[0..2]   schema_id (big-endian 0x1501) — outside the container
+//	--- SszStatelessInput container (20-byte fixed region) ---
 //	[0..4]   offset → new_payload_request
 //	[4..8]   offset → witness
-//	[8..12]  offset → chain_config
-//	[12..16] offset → public_keys
-//	[16..]   variable section, in order: npr, witness, chain_config, public_keys
+//	[8..16]  chain_id (uint64 LE, inline — no longer a nested SszChainConfig)
+//	[16..20] offset → public_keys
+//	[20..]   variable section, in order: npr, witness, public_keys
 //
 // public_keys is SszList[ByteVector[65], MAX_PUBLIC_KEYS] — fixed-size 65-byte
 // elements packed back-to-back. We always emit zero public keys (no pre-
@@ -165,36 +158,41 @@ func encodeSszStatelessInput(f *FixtureFile, txs types.Transactions, withdrawals
 	if err != nil {
 		return nil, err
 	}
-	forkIdx, activationTime := activeForkInfo(f.StatelessInput.ChainConfig, f.StatelessInput.Block.Header.Timestamp)
 	chainID := uint64(1)
 	if f.StatelessInput.ChainConfig != nil && f.StatelessInput.ChainConfig.ChainID != 0 {
 		chainID = f.StatelessInput.ChainConfig.ChainID
 	}
-	chainCfg := buildFixtureSszChainConfig(chainID, forkIdx, activationTime)
+	fork := activeProtocolFork(f.StatelessInput.ChainConfig, f.StatelessInput.Block.Header.Timestamp)
+
+	return encodeStatelessInputContainer(npr, wit, chainID, schemaIDFor(fork)), nil
+}
+
+// encodeStatelessInputContainer emits the schema-id prefix and the
+// SszStatelessInput container around already-encoded sections. Shared by the
+// fixture and live paths so the two can never drift apart.
+func encodeStatelessInputContainer(npr, wit []byte, chainID uint64, schemaID uint16) []byte {
 	var pubKeys []byte // empty packed ByteVector[65] list
 
-	// Fixed region: four uint32 offsets = 16 bytes.
-	const fixedSize = 16
+	// Fixed region: 4 (offset) + 4 (offset) + 8 (chain_id) + 4 (offset) = 20 bytes.
+	const fixedSize = 20
 	offNPR := uint32(fixedSize)
 	offWitness := offNPR + uint32(len(npr))
-	offChainCfg := offWitness + uint32(len(wit))
-	offPubKeys := offChainCfg + uint32(len(chainCfg))
+	offPubKeys := offWitness + uint32(len(wit))
 
 	var out bytes.Buffer
 	// Schema-id prefix (big-endian uint16).
 	var sid [2]byte
-	binary.BigEndian.PutUint16(sid[:], statelessInputSchemaID)
+	binary.BigEndian.PutUint16(sid[:], schemaID)
 	out.Write(sid[:])
 	// Container body.
 	writeU32LE(&out, offNPR)
 	writeU32LE(&out, offWitness)
-	writeU32LE(&out, offChainCfg)
+	binary.Write(&out, binary.LittleEndian, chainID)
 	writeU32LE(&out, offPubKeys)
 	out.Write(npr)
 	out.Write(wit)
-	out.Write(chainCfg)
 	out.Write(pubKeys)
-	return out.Bytes(), nil
+	return out.Bytes()
 }
 
 // encodeSszNewPayloadRequest serialises SszNewPayloadRequest.
@@ -373,14 +371,19 @@ func encodeSszVersionedHashes(txs types.Transactions) []byte {
 	return buf.Bytes()
 }
 
-// encodeSszExecutionRequests encodes an empty SszExecutionRequests container.
-// Container has 3 variable fields (deposits, withdrawals, consolidations).
-// Empty: fixed region = 12 bytes, all offsets point to 12 (no variable data).
+// executionRequestTypes is the number of request lists in SszExecutionRequests.
+// zkevm@v0.6.2 (EIP-8282) grew it from 3 (deposits, withdrawals, consolidations)
+// to 5 by appending builder_deposits and builder_exits.
+const executionRequestTypes = 5
+
+// encodeSszExecutionRequests encodes an empty SszExecutionRequests container:
+// fixed region = 4 bytes per variable field, every offset pointing just past it.
 func encodeSszExecutionRequests() []byte {
+	const fixedSize = 4 * executionRequestTypes
 	var buf bytes.Buffer
-	writeU32LE(&buf, 12)
-	writeU32LE(&buf, 12)
-	writeU32LE(&buf, 12)
+	for i := 0; i < executionRequestTypes; i++ {
+		writeU32LE(&buf, fixedSize)
+	}
 	return buf.Bytes()
 }
 

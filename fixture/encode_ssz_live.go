@@ -13,47 +13,32 @@ import (
 // block is decoded from debug_getRawBlock RLP; state, codes, headers are
 // already-decoded witness byte arrays from debug_executionWitness.
 // balBytes is the RLP-encoded BlockAccessList (nil for pre-Amsterdam).
-// chainCfg is the SSZ-encoded SszChainConfig body; nil falls back to the
-// hardcoded Amsterdam mainnet constant (sszChainConfigAmsterdamMainnet).
-func ZesuInputSSZFromBlock(block *types.Block, state, codes, headers [][]byte, balBytes, chainCfg []byte) ([]byte, error) {
+// chainID is inlined into SszStatelessInput (v0.8.0); 0 falls back to mainnet (1).
+// fork is the ProtocolFork index the block must be executed under, stamped into
+// the schema id; 0 falls back to Amsterdam.
+func ZesuInputSSZFromBlock(block *types.Block, state, codes, headers [][]byte, balBytes []byte, chainID uint64, fork uint8) ([]byte, error) {
 	var parentBeaconRoot common.Hash
 	if r := block.BeaconRoot(); r != nil {
 		parentBeaconRoot = *r
 	}
 
-	return encodeStatelessInputFromBlock(block, state, codes, headers, parentBeaconRoot, balBytes, chainCfg)
+	return encodeStatelessInputFromBlock(block, state, codes, headers, parentBeaconRoot, balBytes, chainID, fork)
 }
 
-func encodeStatelessInputFromBlock(block *types.Block, state, codes, headers [][]byte, parentBeaconRoot common.Hash, balBytes, chainCfg []byte) ([]byte, error) {
+func encodeStatelessInputFromBlock(block *types.Block, state, codes, headers [][]byte, parentBeaconRoot common.Hash, balBytes []byte, chainID uint64, fork uint8) ([]byte, error) {
 	npr, err := encodeNewPayloadRequestFromBlock(block, parentBeaconRoot, balBytes)
 	if err != nil {
 		return nil, err
 	}
 	wit := encodeExecutionWitnessFromArrays(state, codes, headers)
-	if chainCfg == nil {
-		chainCfg = sszChainConfigAmsterdamMainnet
+	if chainID == 0 {
+		chainID = 1 // mainnet
 	}
-	var pubKeys []byte // empty packed ByteVector[65] list — no pre-recovered sigs on live path
+	if fork == 0 {
+		fork = forkAmsterdam
+	}
 
-	const fixedSize = 16
-	offNPR := uint32(fixedSize)
-	offWitness := offNPR + uint32(len(npr))
-	offChainCfg := offWitness + uint32(len(wit))
-	offPubKeys := offChainCfg + uint32(len(chainCfg))
-
-	var out bytes.Buffer
-	var sid [2]byte
-	binary.BigEndian.PutUint16(sid[:], statelessInputSchemaID)
-	out.Write(sid[:])
-	writeU32LE(&out, offNPR)
-	writeU32LE(&out, offWitness)
-	writeU32LE(&out, offChainCfg)
-	writeU32LE(&out, offPubKeys)
-	out.Write(npr)
-	out.Write(wit)
-	out.Write(chainCfg)
-	out.Write(pubKeys)
-	return out.Bytes(), nil
+	return encodeStatelessInputContainer(npr, wit, chainID, schemaIDFor(fork)), nil
 }
 
 func encodeNewPayloadRequestFromBlock(block *types.Block, parentBeaconRoot common.Hash, balBytes []byte) ([]byte, error) {

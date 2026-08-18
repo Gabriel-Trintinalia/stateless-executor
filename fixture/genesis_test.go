@@ -1,7 +1,6 @@
 package fixture
 
 import (
-	"bytes"
 	"encoding/json"
 	"os"
 	"testing"
@@ -14,10 +13,12 @@ var sampleGenesis = map[string]interface{}{
 		"osakaTime":     0,
 		"bpo1Time":      1000,
 		"amsterdamTime": 2000,
+		// amsterdam is deliberately absent from blobSchedule: kurtosis genesis
+		// files declare amsterdamTime without one, and the fork must still be
+		// recognised.
 		"blobSchedule": map[string]interface{}{
-			"osaka":     map[string]uint64{"target": 9, "max": 12, "baseFeeUpdateFraction": 5007716},
-			"bpo1":      map[string]uint64{"target": 14, "max": 21, "baseFeeUpdateFraction": 11685759},
-			"amsterdam": map[string]uint64{"target": 14, "max": 21, "baseFeeUpdateFraction": 11685759},
+			"osaka": map[string]uint64{"target": 9, "max": 12, "baseFeeUpdateFraction": 5007716},
+			"bpo1":  map[string]uint64{"target": 14, "max": 21, "baseFeeUpdateFraction": 11685759},
 		},
 	},
 }
@@ -51,59 +52,26 @@ func TestParseGenesisFile(t *testing.T) {
 	}
 }
 
-func TestSszChainConfig_ActiveFork(t *testing.T) {
+func TestActiveProtocolFork(t *testing.T) {
 	g, err := ParseGenesisFile(writeTempGenesis(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	cases := []struct {
-		ts          uint64
-		wantFork    uint64 // ProtocolFork enum index
-		wantBlobMax uint64
+	// Osaka at t=0, BPO1 at t=1000, Amsterdam at t=2000 — the last declared
+	// without a blob schedule.
+	for _, tc := range []struct {
+		ts   uint64
+		want uint8
 	}{
-		{0, 18, 12},    // Osaka (enum 18) active at t=0
-		{999, 18, 12},  // still Osaka before BPO1
-		{1000, 19, 21}, // BPO1 (enum 19) activates at t=1000
-		{1999, 19, 21}, // still BPO1 before Amsterdam
-		{2000, 24, 21}, // Amsterdam (enum 24) activates at t=2000
-		{9999, 24, 21}, // Amsterdam stays active
-	}
-
-	for _, tc := range cases {
-		cfg := g.SszChainConfig(tc.ts)
-		if cfg == nil {
-			t.Errorf("ts=%d: got nil chain config", tc.ts)
-			continue
-		}
-		// Fork enum is at bytes [12..20] (uint64 LE) within SszChainConfig.
-		// chain_id(8) + offset(4) = 12 byte offset to SszForkConfig start,
-		// then fork enum is first field of SszForkConfig.
-		gotFork := readU64LE(cfg, 12)
-		// BlobMax is at bytes [52..60] (uint64 LE):
-		// 12 (chain_config fixed) + 16 (fork_config fixed) + 16 (activation) + 8 (target) = 52
-		gotMax := readU64LE(cfg, 52)
-
-		if gotFork != tc.wantFork {
-			t.Errorf("ts=%d: fork enum = %d, want %d", tc.ts, gotFork, tc.wantFork)
-		}
-		if gotMax != tc.wantBlobMax {
-			t.Errorf("ts=%d: blob max = %d, want %d", tc.ts, gotMax, tc.wantBlobMax)
+		{0, forkOsaka},
+		{999, forkOsaka},
+		{1000, forkBPO1},
+		{1999, forkBPO1},
+		{2000, forkAmsterdam},
+		{99999, forkAmsterdam},
+	} {
+		if got := g.ActiveProtocolFork(tc.ts); got != tc.want {
+			t.Errorf("ts=%d: fork = 0x%02x, want 0x%02x", tc.ts, got, tc.want)
 		}
 	}
-}
-
-func TestBuildSszChainConfigMatchesConstant(t *testing.T) {
-	got := buildSszChainConfig(1, 24, 0, 14, 21, 0xB24B3F)
-	want := sszChainConfigAmsterdamMainnet[:]
-	if !bytes.Equal(got, want) {
-		t.Errorf("mismatch\ngot:  %x\nwant: %x", got, want)
-	}
-}
-
-func readU64LE(b []byte, off int) uint64 {
-	_ = b[off+7]
-	return uint64(b[off]) | uint64(b[off+1])<<8 | uint64(b[off+2])<<16 |
-		uint64(b[off+3])<<24 | uint64(b[off+4])<<32 | uint64(b[off+5])<<40 |
-		uint64(b[off+6])<<48 | uint64(b[off+7])<<56
 }
