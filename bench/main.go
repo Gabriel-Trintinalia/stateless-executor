@@ -9,6 +9,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -548,18 +549,21 @@ type reportData struct {
 }
 
 type rawBlockRow struct {
-	BlockNum       uint64
-	TxCount        int
-	GasUsed        uint64
-	Base           uint64
-	Main           uint64
-	Opcodes        uint64
-	Precompiles    uint64
-	Memory         uint64
-	Total          uint64
-	PayloadRoot    string // hex of out[0:32]: new_payload_request_root
-	Success        bool   // out[32]: 0x01 = valid
-	ChainConfigHex string // hex of out[33:105]: SszChainConfig
+	BlockNum    uint64
+	TxCount     int
+	GasUsed     uint64
+	Base        uint64
+	Main        uint64
+	Opcodes     uint64
+	Precompiles uint64
+	Memory      uint64
+	Total       uint64
+	// zkevm@v0.8.0: SszStatelessValidationResult is a flat 43 bytes —
+	// root(32) ‖ valid(1) ‖ chain_id(8, LE) ‖ schema_id(2, LE).
+	PayloadRoot string // hex of out[0:32]: new_payload_request_root
+	Success     bool   // out[32]: 0x01 = valid
+	ChainID     uint64 // out[33:41]
+	SchemaID    uint16 // out[41:43]
 }
 
 type execFailedRow struct {
@@ -702,10 +706,11 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 			Memory:      r.Costs.Memory,
 			Total:       r.Costs.Total,
 		}
-		if b, err := hex.DecodeString(r.OutputHex); err == nil && len(b) >= 105 {
+		if b, err := hex.DecodeString(r.OutputHex); err == nil && len(b) >= 43 {
 			row.PayloadRoot = hex.EncodeToString(b[0:32])
 			row.Success = b[32] == 0x01
-			row.ChainConfigHex = hex.EncodeToString(b[33:105])
+			row.ChainID = binary.LittleEndian.Uint64(b[33:41])
+			row.SchemaID = binary.LittleEndian.Uint16(b[41:43])
 		}
 		rawBlocks[i] = row
 	}

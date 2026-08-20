@@ -5,8 +5,8 @@
 //
 //	[u64 LE: ssz_len] [SszStatelessInput bytes, padded to 8-byte boundary]
 //
-// SSZ schema: 2-byte big-endian schema_id (0x0001) followed by SszStatelessInput
-// as defined in stateless_ssz.py (zkevm@v0.5.0 / glamsterdam-devnet-6).
+// SSZ schema: 2-byte big-endian schema_id (0x1501) followed by SszStatelessInput
+// as defined in stateless_ssz.py (zkevm@v0.8.0 / glamsterdam-devnet-8).
 package pipeline
 
 import (
@@ -69,8 +69,8 @@ type witness struct {
 // Fetch retrieves the block RLP and witness for blockNum, then encodes them
 // into the SSZ guest input format. Returns the encoded bytes, the EL
 // node hostname that served the witness, and lightweight block metadata.
-// genesis is optional; if non-nil its SszChainConfig is derived from the
-// block timestamp; if nil the hardcoded Amsterdam mainnet constant is used.
+// genesis is optional; if non-nil its chain id is inlined into the input,
+// otherwise mainnet (1) is assumed.
 func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64, genesis *fixture.GenesisChainConfig, verbose bool, engineURL, jwtSecretFile string) ([]byte, string, BlockMeta, error) {
 	rawURL := p.Pick()
 	if rawURL == "" {
@@ -179,12 +179,18 @@ func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64, genesis *fixture.
 			blockNum, elNode, len(w.State), len(w.Codes), len(w.Keys), len(headers), w.Headers)
 	}
 
-	var chainCfg []byte
+	// zkevm@v0.8.0: SszStatelessInput carries a bare chain_id, and the fork the
+	// block must be executed under rides in the schema id instead of a nested
+	// fork descriptor. Both come from genesis; absent it, the encoder defaults
+	// to mainnet/Amsterdam.
+	var chainID uint64
+	var fork uint8
 	if genesis != nil {
-		chainCfg = genesis.SszChainConfig(block.Time())
+		chainID = genesis.ChainID
+		fork = genesis.ActiveProtocolFork(block.Time())
 	}
 
-	encoded, err := fixture.ZesuInputSSZFromBlock(block, state, codes, headers, balBytes, chainCfg)
+	encoded, err := fixture.ZesuInputSSZFromBlock(block, state, codes, headers, balBytes, chainID, fork)
 	return encoded, elNode, meta, err
 }
 

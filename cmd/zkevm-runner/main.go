@@ -140,7 +140,7 @@ func main() {
 			if len(expectedOutputHex) > 0 && len(gotOutputCmp) > len(expectedOutputHex) {
 				gotOutputCmp = gotOutputCmp[:len(expectedOutputHex)]
 			}
-			// glamsterdam-devnet-6 / zkevm@v0.5.0: expectedSuccess comes from the fixture's
+			// glamsterdam-devnet-8 / zkevm@v0.8.0: expectedSuccess comes from the fixture's
 			// SszStatelessValidationResult byte 32 (successful_validation), NOT from
 			// the block-level expectException field. Reason: expectException asserts
 			// the block is invalid at some layer, but the t8n pipeline's stateless

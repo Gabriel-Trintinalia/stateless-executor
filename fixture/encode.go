@@ -21,10 +21,10 @@ var ErrMissingStatelessInputBytes = errors.New("statelessInputBytes missing — 
 // ziskemu-ready binary input. Requires the fixture to carry pre-encoded SSZ
 // statelessInputBytes (Amsterdam+); pre-Amsterdam fixtures are unsupported.
 //
-// glamsterdam-devnet-6 / zkevm@v0.5.0: the fixture's statelessInputBytes already
-// includes the 2-byte schema id and the full SszChainConfig (with active
-// fork descriptor), so no injection is needed — the runner just wraps the
-// raw bytes in the ziskemu length-prefixed framing.
+// glamsterdam-devnet-8 / zkevm@v0.8.0: the fixture's statelessInputBytes already
+// includes the 2-byte schema id and the inline chain_id, so no injection is
+// needed — the runner just wraps the raw bytes in the ziskemu length-prefixed
+// framing.
 func ZesuInputFromZkevmBlock(tc *ZkevmTestCase, block *ZkevmBlock) ([]byte, bool, error) {
 	_ = tc
 	expectedSuccess := block.ExpectException == ""
