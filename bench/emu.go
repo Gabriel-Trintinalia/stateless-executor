@@ -119,6 +119,61 @@ func runEmu(o emuOpts, input []byte) (emuResult, error) {
 	return r, nil
 }
 
+// runOpenVM is the OpenVM equivalent of runEmu. OpenVM emulation produces no
+// circuit cost breakdown, so a missing cost table is not an error here, and the
+// guest's verdict is read from the output region rather than from an
+// "execution failed" line.
+//
+// The 41-byte minimum is carried over verbatim from the previous
+// implementation; it predates the 43-byte zkevm@v0.8.0 result layout and is
+// corrected separately.
+func runOpenVM(o emuOpts, input []byte) (emuResult, error) {
+	var r emuResult
+
+	inFile, err := os.CreateTemp("", "zesu-bench-in-*.bin")
+	if err != nil {
+		return r, err
+	}
+	defer os.Remove(inFile.Name())
+	if _, err := inFile.Write(input); err != nil {
+		inFile.Close()
+		return r, err
+	}
+	if err := inFile.Close(); err != nil {
+		return r, err
+	}
+
+	outFile, err := os.CreateTemp("", "zesu-bench-out-*.bin")
+	if err != nil {
+		return r, err
+	}
+	outPath := outFile.Name()
+	outFile.Close()
+	defer os.Remove(outPath)
+
+	out, runErr := exec.Command(o.Bin, "-X", "-e", o.ELF, "-i", inFile.Name(), "-o", outPath).
+		CombinedOutput()
+	r.RawOut = strings.TrimSpace(string(out))
+	if runErr != nil {
+		return r, fmt.Errorf("runner: %w", runErr)
+	}
+
+	outBytes, err := os.ReadFile(outPath)
+	if err != nil {
+		return r, fmt.Errorf("read output: %w", err)
+	}
+	if len(outBytes) < 41 {
+		return r, fmt.Errorf("output too short: %d bytes (expected 41)", len(outBytes))
+	}
+	r.OutputHex = hex.EncodeToString(outBytes)
+
+	if outBytes[32] == 0 {
+		r.ExecErr = "ExecutionFailed"
+	}
+	r.Costs, _ = parseCostReport(r.RawOut)
+	return r, nil
+}
+
 func allZero(b []byte) bool {
 	for _, c := range b {
 		if c != 0 {

@@ -17,14 +17,10 @@ import (
 	"html/template"
 	"log"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Gabriel-Trintinalia/stateless-executor/fixture"
@@ -48,6 +44,10 @@ type CostReport struct {
 type BlockResult struct {
 	BlockNum        uint64
 	Name            string
+	Label           string // unit label: corpus file stem, or EEST test-case name[/blockN]
+	Suite           string // fixture dir relative to the fixtures root
+	Network         string // EEST only; "" for corpus
+	Verdict         verdict
 	Target          string // "zisk" or "openvm"
 	Costs           CostReport
 	Err             error
@@ -132,90 +132,20 @@ func main() {
 		}
 	}
 
-	paths := make([]string, len(jobsFound))
-	for i, j := range jobsFound {
-		paths[i] = j.Path
-	}
-	log.Printf("found %d fixtures, running with %s/%s (%d job(s))...", len(paths), *targetFlag, *zkvmPath, *jobs)
+	log.Printf("found %d fixtures, running with %s/%s (%d job(s))...", len(jobsFound), *targetFlag, *zkvmPath, *jobs)
 
-	var runBench func(fixturePath string) (CostReport, string, string, error, bool, blockInfo)
+	o := emuOpts{ELF: *elfPath, Bin: *zkvmPath, MaxSteps: *maxSteps}
+	var run emuRunner
 	if *targetFlag == "openvm" {
-		ep, zp := *elfPath, *zkvmPath
-		runBench = func(p string) (CostReport, string, string, error, bool, blockInfo) {
-			costs, execErr, out, err, ok := benchOneOpenVM(p, ep, zp)
-			return costs, execErr, out, err, ok, blockInfo{}
-		}
+		run = func(input []byte) (emuResult, error) { return runOpenVM(o, input) }
 	} else {
-		o := emuOpts{ELF: *elfPath, Bin: *zkvmPath, MaxSteps: *maxSteps}
-		runBench = func(p string) (CostReport, string, string, error, bool, blockInfo) {
-			return benchOne(p, o)
-		}
+		run = func(input []byte) (emuResult, error) { return runEmu(o, input) }
 	}
 
-	results := make([]BlockResult, len(paths))
-	sem := make(chan struct{}, *jobs)
-	var wg sync.WaitGroup
-	var done atomic.Int64
-
-	for i, p := range paths {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(idx int, path string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			name := strings.TrimSuffix(filepath.Base(path), ".json")
-			blockNum := extractBlockNum(name)
-			t := time.Now()
-			costs, execErr, errOut, runErr, expectedSuccess, bi := runBench(path)
-			elapsed := time.Since(t)
-			gotSuccess := runErr == nil && execErr == ""
-			validationOK := runErr == nil && gotSuccess == expectedSuccess
-			n := done.Add(1)
-			if runErr != nil {
-				fmt.Printf("[%3d/%d] ERROR %-40s  %v\n", n, len(paths), name, runErr)
-			} else if !validationOK {
-				if *targetFlag == "openvm" {
-					fmt.Printf("[%3d/%d] block %d  VALIDATION FAILED (expected success=%v)  (%s)\n", n, len(paths), blockNum, expectedSuccess, elapsed.Round(time.Millisecond))
-				} else {
-					fmt.Printf("[%3d/%d] block %d  total=%d  VALIDATION FAILED (expected success=%v)  (%s)\n", n, len(paths), blockNum, costs.Total, expectedSuccess, elapsed.Round(time.Millisecond))
-				}
-			} else if execErr != "" {
-				if *targetFlag == "openvm" {
-					fmt.Printf("[%3d/%d] block %d  EXEC FAILED (expected): %s  (%s)\n", n, len(paths), blockNum, execErr, elapsed.Round(time.Millisecond))
-				} else {
-					fmt.Printf("[%3d/%d] block %d  total=%d  EXEC FAILED (expected): %s  (%s)\n", n, len(paths), blockNum, costs.Total, execErr, elapsed.Round(time.Millisecond))
-				}
-			} else {
-				if *targetFlag == "openvm" {
-					fmt.Printf("[%3d/%d] block %d  (%s)\n", n, len(paths), blockNum, elapsed.Round(time.Millisecond))
-				} else {
-					fmt.Printf("[%3d/%d] block %d  total=%d  (%s)\n", n, len(paths), blockNum, costs.Total, elapsed.Round(time.Millisecond))
-				}
-			}
-			results[idx] = BlockResult{
-				BlockNum:        blockNum,
-				Name:            name,
-				Target:          *targetFlag,
-				Costs:           costs,
-				Err:             runErr,
-				ErrOutput:       errOut,
-				ExecError:       execErr,
-				Elapsed:         elapsed,
-				ExpectedSuccess: expectedSuccess,
-				ValidationOK:    validationOK,
-				TxCount:         bi.TxCount,
-				GasUsed:         bi.GasUsed,
-				LegacyTxs:       bi.LegacyTxs,
-				Eip1559Txs:      bi.Eip1559Txs,
-				Eip2930Txs:      bi.Eip2930Txs,
-				Eip4844Txs:      bi.Eip4844Txs,
-				Eip7702Txs:      bi.Eip7702Txs,
-				OutputHex:       bi.OutputHex,
-			}
-		}(i, p)
+	results := runAll(jobsFound, run, *targetFlag, *jobs)
+	if len(results) == 0 {
+		log.Fatalf("no runnable units across %d file(s)", len(jobsFound))
 	}
-	wg.Wait()
 
 	var good []BlockResult
 	var validationFailures []BlockResult
@@ -292,31 +222,6 @@ func writeCSV(path string, results []BlockResult) error {
 	return nil
 }
 
-// benchOne returns (costs, execError, rawOutput, error, expectedSuccess, blockInfo) for a ZisK run.
-func benchOne(fixturePath string, o emuOpts) (CostReport, string, string, error, bool, blockInfo) {
-	f, err := fixture.LoadFile(fixturePath)
-	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false, blockInfo{}
-	}
-
-	bi := extractBlockInfo(f)
-
-	input, err := fixture.ZesuInputSSZ(f)
-	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success, bi
-	}
-
-	// runEmu reports a step-capped or verdict-less run as an error, which is what
-	// keeps its truncated costs out of the statistics and the charts.
-	r, err := runEmu(o, input)
-	bi.OutputHex = r.OutputHex
-	if err != nil {
-		return CostReport{}, "", r.RawOut, err, f.Success, bi
-	}
-
-	return r.Costs, r.ExecErr, r.RawOut, nil, f.Success, bi
-}
-
 func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
 	bi := blockInfo{}
 	txs := f.StatelessInput.Block.Body.Transactions
@@ -337,64 +242,6 @@ func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
 	}
 	bi.GasUsed = f.StatelessInput.Block.Header.GasUsed
 	return bi
-}
-
-// benchOneOpenVM returns (costs, execError, rawOutput, error, expectedSuccess) for an OpenVM run.
-// costs is always zero — OpenVM emulation does not produce a circuit cost breakdown.
-// execError is "ExecutionFailed" when the guest writes success=0 to public values byte[32].
-func benchOneOpenVM(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool) {
-	f, err := fixture.LoadFile(fixturePath)
-	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false
-	}
-
-	input, err := fixture.ZesuInputSSZ(f)
-	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success
-	}
-
-	tmpIn, err := os.CreateTemp("", "zesu-bench-in-*.bin")
-	if err != nil {
-		return CostReport{}, "", "", err, f.Success
-	}
-	defer os.Remove(tmpIn.Name())
-	if _, err := tmpIn.Write(input); err != nil {
-		tmpIn.Close()
-		return CostReport{}, "", "", err, f.Success
-	}
-	if err := tmpIn.Close(); err != nil {
-		return CostReport{}, "", "", err, f.Success
-	}
-
-	tmpOut, err := os.CreateTemp("", "zesu-bench-out-*.bin")
-	if err != nil {
-		return CostReport{}, "", "", err, f.Success
-	}
-	tmpOutPath := tmpOut.Name()
-	tmpOut.Close()
-	defer os.Remove(tmpOutPath)
-
-	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmpIn.Name(), "-o", tmpOutPath).
-		CombinedOutput()
-	rawOut := strings.TrimSpace(string(out))
-	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("runner: %w", err), f.Success
-	}
-
-	outBytes, err := os.ReadFile(tmpOutPath)
-	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("read output: %w", err), f.Success
-	}
-	if len(outBytes) < 41 {
-		return CostReport{}, "", rawOut, fmt.Errorf("output too short: %d bytes (expected 41)", len(outBytes)), f.Success
-	}
-
-	execErr := ""
-	if outBytes[32] == 0 {
-		execErr = "ExecutionFailed"
-	}
-	costs, _ := parseCostReport(rawOut)
-	return costs, execErr, rawOut, nil, f.Success
 }
 
 var execFailedRe = regexp.MustCompile(`error: execution failed: (\S+)`)
