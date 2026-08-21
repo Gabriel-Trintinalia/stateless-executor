@@ -41,6 +41,7 @@ type CostReport struct {
 	Memory       uint64
 	Total        uint64
 	Instructions uint64 // OpenVM: retired instruction count (deterministic)
+	Steps        uint64 // ZisK: emulated steps; compared against the step cap
 }
 
 // BlockResult holds the outcome of running one fixture block.
@@ -56,14 +57,14 @@ type BlockResult struct {
 	ExpectedSuccess bool
 	ValidationOK    bool
 	// Block characteristics for correlation analysis.
-	TxCount     int
-	GasUsed     uint64
-	LegacyTxs   int
-	Eip1559Txs  int
-	Eip2930Txs  int
-	Eip4844Txs  int
-	Eip7702Txs  int
-	OutputHex string
+	TxCount    int
+	GasUsed    uint64
+	LegacyTxs  int
+	Eip1559Txs int
+	Eip2930Txs int
+	Eip4844Txs int
+	Eip7702Txs int
+	OutputHex  string
 }
 
 var blockNumRe = regexp.MustCompile(`block_(\d+)`)
@@ -77,6 +78,7 @@ func main() {
 	reportPath := flag.String("report", "bench_report.html", "output HTML report path")
 	csvPath := flag.String("csv", "", "optional path to write per-block CSV (block_num,tx_count,gas_used,legacy,eip1559,eip2930,eip4844,eip7702,base,main,opcodes,precompiles,memory,total,elapsed_ms)")
 	dryRun := flag.Bool("dry-run", false, "discover fixtures, print the per-format census, and exit without running the emulator")
+	maxSteps := flag.Uint64("maxSteps", 0, "emulator step cap, passed as -n; 0 leaves the emulator on its default (68719476735)")
 	flag.Parse()
 
 	if *fixturesDir == "" {
@@ -144,9 +146,9 @@ func main() {
 			return costs, execErr, out, err, ok, blockInfo{}
 		}
 	} else {
-		ep, zp := *elfPath, *zkvmPath
+		o := emuOpts{ELF: *elfPath, Bin: *zkvmPath, MaxSteps: *maxSteps}
 		runBench = func(p string) (CostReport, string, string, error, bool, blockInfo) {
-			return benchOne(p, ep, zp)
+			return benchOne(p, o)
 		}
 	}
 
@@ -291,7 +293,7 @@ func writeCSV(path string, results []BlockResult) error {
 }
 
 // benchOne returns (costs, execError, rawOutput, error, expectedSuccess, blockInfo) for a ZisK run.
-func benchOne(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool, blockInfo) {
+func benchOne(fixturePath string, o emuOpts) (CostReport, string, string, error, bool, blockInfo) {
 	f, err := fixture.LoadFile(fixturePath)
 	if err != nil {
 		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false, blockInfo{}
@@ -304,45 +306,15 @@ func benchOne(fixturePath, elfPath, zkvmPath string) (CostReport, string, string
 		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success, bi
 	}
 
-	tmp, err := os.CreateTemp("", "zesu-bench-*.bin")
+	// runEmu reports a step-capped or verdict-less run as an error, which is what
+	// keeps its truncated costs out of the statistics and the charts.
+	r, err := runEmu(o, input)
+	bi.OutputHex = r.OutputHex
 	if err != nil {
-		return CostReport{}, "", "", err, f.Success, bi
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(input); err != nil {
-		tmp.Close()
-		return CostReport{}, "", "", err, f.Success, bi
-	}
-	if err := tmp.Close(); err != nil {
-		return CostReport{}, "", "", err, f.Success, bi
+		return CostReport{}, "", r.RawOut, err, f.Success, bi
 	}
 
-	outFile, err := os.CreateTemp("", "zesu-bench-out-*.bin")
-	if err != nil {
-		return CostReport{}, "", "", err, f.Success, bi
-	}
-	outPath := outFile.Name()
-	outFile.Close()
-	defer os.Remove(outPath)
-
-	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmp.Name(), "-o", outPath).
-		CombinedOutput()
-	rawOut := strings.TrimSpace(string(out))
-	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("zkvm: %w", err), f.Success, bi
-	}
-
-	costs, ok := parseCostReport(rawOut)
-	if !ok {
-		return CostReport{}, "", rawOut, fmt.Errorf("no COST DISTRIBUTION in ziskemu output"), f.Success, bi
-	}
-	execErr := parseExecError(rawOut)
-
-	if outBytes, err2 := os.ReadFile(outPath); err2 == nil {
-		bi.OutputHex = hex.EncodeToString(outBytes)
-	}
-
-	return costs, execErr, rawOut, nil, f.Success, bi
+	return r.Costs, r.ExecErr, r.RawOut, nil, f.Success, bi
 }
 
 func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
@@ -458,6 +430,13 @@ func parseCostReport(output string) (CostReport, bool) {
 		} else if v, ok := parseCostLine(line, "INSTRUCTIONS"); ok {
 			r.Instructions = v
 			found = true
+		} else if v, ok := parseCostLine(line, "STEPS"); ok {
+			// Deliberately does not set `found`: STEPS sits in the REPORT
+			// header above the cost table, so letting it satisfy `found` would
+			// mask a run that produced no cost distribution at all.
+			// The numeric parse is what disambiguates this from the
+			// "STEPS PROFILE TAGS" section header further down the transcript.
+			r.Steps = v
 		} else if v, ok := parseCostLine(line, "TOTAL"); ok {
 			r.Total = v
 		}
