@@ -4,7 +4,8 @@
 //
 // Usage:
 //
-//	bench --fixtures <dir> --elf <path> [--target zisk|openvm] [--ziskemu <path>] [--runner <path>] [--jobs N] [--report <path>]
+//	bench --fixtures <dir|file> --elf <path> [--target zisk|openvm] [--zkvmPath <path>]
+//	      [--jobs N] [--report <path>] [--csv <path>] [--dry-run]
 package main
 
 import (
@@ -75,14 +76,23 @@ func main() {
 	jobs := flag.Int("jobs", 1, "number of parallel emulator runs")
 	reportPath := flag.String("report", "bench_report.html", "output HTML report path")
 	csvPath := flag.String("csv", "", "optional path to write per-block CSV (block_num,tx_count,gas_used,legacy,eip1559,eip2930,eip4844,eip7702,base,main,opcodes,precompiles,memory,total,elapsed_ms)")
+	dryRun := flag.Bool("dry-run", false, "discover fixtures, print the per-format census, and exit without running the emulator")
 	flag.Parse()
 
-	if *fixturesDir == "" || *elfPath == "" {
+	if *fixturesDir == "" {
+		flag.Usage()
+		os.Exit(1)
+	}
+	// --dry-run touches no emulator, so it does not need an ELF.
+	if *elfPath == "" && !*dryRun {
 		flag.Usage()
 		os.Exit(1)
 	}
 	if *targetFlag != "zisk" && *targetFlag != "openvm" {
 		log.Fatalf("unknown target %q: must be zisk or openvm", *targetFlag)
+	}
+	if *jobs < 1 {
+		log.Fatalf("--jobs must be at least 1, got %d", *jobs)
 	}
 	if *zkvmPath == "" {
 		if *targetFlag == "openvm" {
@@ -91,16 +101,38 @@ func main() {
 			*zkvmPath = "ziskemu"
 		}
 	}
-	if _, err := os.Stat(*elfPath); err != nil {
-		log.Fatalf("ELF not found at %s: %v", *elfPath, err)
+	if !*dryRun {
+		if _, err := os.Stat(*elfPath); err != nil {
+			log.Fatalf("ELF not found at %s: %v", *elfPath, err)
+		}
 	}
 
-	paths, err := collectJSON(*fixturesDir)
+	jobsFound, skipped, err := discover(*fixturesDir)
 	if err != nil {
 		log.Fatalf("collect fixtures: %v", err)
 	}
-	if len(paths) == 0 {
-		log.Fatalf("no JSON fixtures found in %s", *fixturesDir)
+	if *dryRun {
+		printCensus(census{Jobs: jobsFound, Skipped: skipped})
+		return
+	}
+	for _, s := range skipped {
+		log.Printf("SKIP %s: %s", s.Path, s.Reason)
+	}
+	if len(jobsFound) == 0 {
+		log.Fatalf("no runnable JSON fixtures found in %s (%d skipped)", *fixturesDir, len(skipped))
+	}
+
+	// EEST support lands in a later step; until then refuse rather than
+	// mis-running a zkevm fixture through the corpus loader.
+	for _, j := range jobsFound {
+		if j.Kind != fixture.FormatCorpus {
+			log.Fatalf("%s: %s fixtures are not runnable yet (use --dry-run to inspect)", j.Path, j.Kind)
+		}
+	}
+
+	paths := make([]string, len(jobsFound))
+	for i, j := range jobsFound {
+		paths[i] = j.Path
 	}
 	log.Printf("found %d fixtures, running with %s/%s (%d job(s))...", len(paths), *targetFlag, *zkvmPath, *jobs)
 
@@ -1050,25 +1082,3 @@ new Chart(document.getElementById('stackedChart'), {
 </body>
 </html>
 `))
-
-func collectJSON(path string) ([]string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() {
-		return []string{path}, nil
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return nil, err
-	}
-	var paths []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
-			paths = append(paths, filepath.Join(path, e.Name()))
-		}
-	}
-	sort.Strings(paths)
-	return paths, nil
-}
