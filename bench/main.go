@@ -9,7 +9,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
@@ -27,20 +26,6 @@ import (
 
 	"github.com/Gabriel-Trintinalia/stateless-executor/fixture"
 )
-
-// CostReport holds the parsed COST DISTRIBUTION table for one block.
-// ZisK populates Base/Main/Opcodes/Precompiles/Memory/Total (circuit trace cells).
-// OpenVM populates Instructions/Total (retired instruction count).
-type CostReport struct {
-	Base         uint64
-	Main         uint64
-	Opcodes      uint64
-	Precompiles  uint64
-	Memory       uint64
-	Total        uint64
-	Instructions uint64 // OpenVM: retired instruction count (deterministic)
-	Steps        uint64 // ZisK: emulated steps; compared against the step cap
-}
 
 // BlockResult holds the outcome of running one fixture block.
 type BlockResult struct {
@@ -301,70 +286,6 @@ func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
 	}
 	bi.GasUsed = f.StatelessInput.Block.Header.GasUsed
 	return bi
-}
-
-var execFailedRe = regexp.MustCompile(`error: execution failed: (\S+)`)
-
-func parseExecError(output string) string {
-	m := execFailedRe.FindStringSubmatch(output)
-	if len(m) < 2 {
-		return ""
-	}
-	return m[1]
-}
-
-// parseCostReport parses a COST DISTRIBUTION table from combined runner output.
-// Handles both ZisK (BASE/MAIN/OPCODES/PRECOMPILES/MEMORY/TOTAL) and
-// OpenVM (ELAPSED_MS/TOTAL) table formats.
-func parseCostReport(output string) (CostReport, bool) {
-	var r CostReport
-	sc := bufio.NewScanner(strings.NewReader(output))
-	found := false
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if v, ok := parseCostLine(line, "BASE"); ok {
-			r.Base = v
-			found = true
-		} else if v, ok := parseCostLine(line, "MAIN"); ok {
-			r.Main = v
-		} else if v, ok := parseCostLine(line, "OPCODES"); ok {
-			r.Opcodes = v
-		} else if v, ok := parseCostLine(line, "PRECOMPILES"); ok {
-			r.Precompiles = v
-		} else if v, ok := parseCostLine(line, "MEMORY"); ok {
-			r.Memory = v
-		} else if v, ok := parseCostLine(line, "INSTRUCTIONS"); ok {
-			r.Instructions = v
-			found = true
-		} else if v, ok := parseCostLine(line, "STEPS"); ok {
-			// Deliberately does not set `found`: STEPS sits in the REPORT
-			// header above the cost table, so letting it satisfy `found` would
-			// mask a run that produced no cost distribution at all.
-			// The numeric parse is what disambiguates this from the
-			// "STEPS PROFILE TAGS" section header further down the transcript.
-			r.Steps = v
-		} else if v, ok := parseCostLine(line, "TOTAL"); ok {
-			r.Total = v
-		}
-	}
-	return r, found
-}
-
-func parseCostLine(line, label string) (uint64, bool) {
-	rest, ok := strings.CutPrefix(line, label)
-	if !ok {
-		return 0, false
-	}
-	fields := strings.Fields(rest)
-	if len(fields) == 0 {
-		return 0, false
-	}
-	clean := strings.ReplaceAll(fields[0], ",", "")
-	n, err := strconv.ParseUint(clean, 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
 }
 
 func extractBlockNum(name string) uint64 {

@@ -1,4 +1,4 @@
-package main
+package emu
 
 import (
 	"os"
@@ -16,7 +16,7 @@ func TestParseCostReportGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := parseCostReport(string(b))
+	got, ok := ParseCostReport(string(b))
 	if !ok {
 		t.Fatal("parseCostReport reported no cost table")
 	}
@@ -40,7 +40,7 @@ func TestParseCostReportGolden(t *testing.T) {
 // distribution at all would be reported as a clean success.
 func TestParseCostReportStepsDoesNotSatisfyFound(t *testing.T) {
 	out := "input_len=1234\n\nREPORT\n------\nSTEPS   1,000,000\n"
-	got, ok := parseCostReport(out)
+	got, ok := ParseCostReport(out)
 	if ok {
 		t.Error("STEPS alone satisfied the found flag; it must not")
 	}
@@ -59,7 +59,7 @@ func TestParseCostReportIgnoresStepsHeaders(t *testing.T) {
 		"RAM USAGE      38,888,448   7.27%",
 		"FROPS          909,092,661,212  13.02%",
 	}, "\n")
-	got, ok := parseCostReport(out)
+	got, ok := ParseCostReport(out)
 	if !ok {
 		t.Fatal("expected BASE to satisfy the found flag")
 	}
@@ -77,10 +77,10 @@ func TestParseCostReportIgnoresStepsHeaders(t *testing.T) {
 }
 
 func TestEffectiveMaxSteps(t *testing.T) {
-	if got := (emuOpts{}).effectiveMaxSteps(); got != defaultZiskMaxSteps {
-		t.Errorf("MaxSteps 0: effective = %d, want the emulator default %d", got, defaultZiskMaxSteps)
+	if got := (Opts{}).EffectiveMaxSteps(); got != DefaultZiskMaxSteps {
+		t.Errorf("MaxSteps 0: effective = %d, want the emulator default %d", got, DefaultZiskMaxSteps)
 	}
-	if got := (emuOpts{MaxSteps: 500}).effectiveMaxSteps(); got != 500 {
+	if got := (Opts{MaxSteps: 500}).EffectiveMaxSteps(); got != 500 {
 		t.Errorf("MaxSteps 500: effective = %d, want 500", got)
 	}
 }
@@ -93,17 +93,17 @@ func TestStepLimitDetectedAtEmulatorDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	costs, _ := parseCostReport(string(b))
+	costs, _ := ParseCostReport(string(b))
 
-	if costs.Steps < (emuOpts{}).effectiveMaxSteps() {
-		t.Fatalf("steps %d did not reach the default cap %d", costs.Steps, defaultZiskMaxSteps)
+	if costs.Steps < (Opts{}).EffectiveMaxSteps() {
+		t.Fatalf("steps %d did not reach the default cap %d", costs.Steps, DefaultZiskMaxSteps)
 	}
 	// And an explicit lower cap must also trip.
-	if costs.Steps < (emuOpts{MaxSteps: 1000000}).effectiveMaxSteps() {
+	if costs.Steps < (Opts{MaxSteps: 1000000}).EffectiveMaxSteps() {
 		t.Error("steps did not reach an explicit low cap")
 	}
 	// A run well under the cap must not trip.
-	if (CostReport{Steps: 1000}).Steps >= (emuOpts{MaxSteps: 1000000}).effectiveMaxSteps() {
+	if (CostReport{Steps: 1000}).Steps >= (Opts{MaxSteps: 1000000}).EffectiveMaxSteps() {
 		t.Error("a run far below the cap was flagged as capped")
 	}
 }
@@ -119,10 +119,10 @@ func TestAllZero(t *testing.T) {
 
 // A missing, short, or all-zero output region means the guest never wrote a
 // verdict, which must never read as a pass.
-func TestRunEmuFlagsShortOutput(t *testing.T) {
+func TestRunFlagsShortOutput(t *testing.T) {
 	// `true` ignores its args, writes nothing, and exits 0 — a stand-in for an
 	// emulator that produced no output region.
-	r, err := runEmu(emuOpts{ELF: "/dev/null", Bin: "true"}, []byte{0x01})
+	r, err := Run(Opts{ELF: "/dev/null", Bin: "true", RequireCosts: true}, []byte{0x01})
 	if err == nil {
 		t.Error("expected an error when the emulator emits no cost report")
 	}
@@ -131,8 +131,8 @@ func TestRunEmuFlagsShortOutput(t *testing.T) {
 	}
 }
 
-func TestRunEmuMissingBinary(t *testing.T) {
-	if _, err := runEmu(emuOpts{ELF: "/dev/null", Bin: "definitely-not-a-real-emulator"}, []byte{0x01}); err == nil {
+func TestRunMissingBinary(t *testing.T) {
+	if _, err := Run(Opts{ELF: "/dev/null", Bin: "definitely-not-a-real-emulator"}, []byte{0x01}); err == nil {
 		t.Fatal("expected an error for a missing emulator binary")
 	}
 }
