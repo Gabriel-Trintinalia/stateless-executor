@@ -11,7 +11,9 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/csv"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
@@ -166,7 +168,7 @@ func main() {
 			}
 		}
 	}
-	sort.Slice(good, func(i, j int) bool { return good[i].BlockNum < good[j].BlockNum })
+	sortResults(good)
 
 	if len(good) > 0 {
 		printSummary(good, len(results), len(validationFailures), *targetFlag)
@@ -202,33 +204,81 @@ type blockInfo struct {
 	OutputHex  string
 }
 
+// sortResults orders rows for the CSV and the report.
+//
+// Corpus rows sort by block number — not by label, which sorts wrong across the
+// 8-to-9-digit boundary. EEST block numbers are all 1 or 2 within a fixture and
+// so cannot order anything; those sort by (suite, label, block number).
+//
+// The sort is stable in both cases. With an unstable sort, EEST rows would come
+// out in a different order on every run, destroying the A/B diffing the tool
+// exists for.
+func sortResults(rs []BlockResult) {
+	sort.SliceStable(rs, func(i, j int) bool {
+		a, b := rs[i], rs[j]
+		if a.Kind == fixture.FormatZkevm || b.Kind == fixture.FormatZkevm {
+			if a.Suite != b.Suite {
+				return a.Suite < b.Suite
+			}
+			if a.Label != b.Label {
+				return a.Label < b.Label
+			}
+		}
+		return a.BlockNum < b.BlockNum
+	})
+}
+
+// csvHeader is the column order. New columns are appended rather than
+// interleaved, so the first fifteen fields are unchanged and positional
+// accessors into the archived runs ($14 total, $15 elapsed_ms) keep working.
+var csvHeader = []string{
+	"block_num", "tx_count", "gas_used",
+	"legacy", "eip1559", "eip2930", "eip4844", "eip7702",
+	"base", "main", "opcodes", "precompiles", "memory", "total", "elapsed_ms",
+	"steps", "suite", "label",
+}
+
+// writeCSV uses encoding/csv because EEST labels contain commas, brackets and
+// colons and have to be quoted. Numeric fields are never quoted, so corpus rows
+// come out byte-identical to the hand-rolled Fprintf this replaces.
 func writeCSV(path string, results []BlockResult) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	fmt.Fprintln(f, "block_num,tx_count,gas_used,legacy,eip1559,eip2930,eip4844,eip7702,base,main,opcodes,precompiles,memory,total,elapsed_ms")
-	for _, r := range results {
-		fmt.Fprintf(f, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
-			r.BlockNum,
-			r.TxCount,
-			r.GasUsed,
-			r.LegacyTxs,
-			r.Eip1559Txs,
-			r.Eip2930Txs,
-			r.Eip4844Txs,
-			r.Eip7702Txs,
-			r.Costs.Base,
-			r.Costs.Main,
-			r.Costs.Opcodes,
-			r.Costs.Precompiles,
-			r.Costs.Memory,
-			r.Costs.Total,
-			r.Elapsed.Milliseconds(),
-		)
+
+	w := csv.NewWriter(f)
+	if err := w.Write(csvHeader); err != nil {
+		return err
 	}
-	return nil
+	u := func(v uint64) string { return strconv.FormatUint(v, 10) }
+	for _, r := range results {
+		if err := w.Write([]string{
+			u(r.BlockNum),
+			strconv.Itoa(r.TxCount),
+			u(r.GasUsed),
+			strconv.Itoa(r.LegacyTxs),
+			strconv.Itoa(r.Eip1559Txs),
+			strconv.Itoa(r.Eip2930Txs),
+			strconv.Itoa(r.Eip4844Txs),
+			strconv.Itoa(r.Eip7702Txs),
+			u(r.Costs.Base),
+			u(r.Costs.Main),
+			u(r.Costs.Opcodes),
+			u(r.Costs.Precompiles),
+			u(r.Costs.Memory),
+			u(r.Costs.Total),
+			strconv.FormatInt(r.Elapsed.Milliseconds(), 10),
+			u(r.Costs.Steps),
+			r.Suite,
+			r.Label,
+		}); err != nil {
+			return err
+		}
+	}
+	w.Flush()
+	return w.Error()
 }
 
 func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
@@ -399,6 +449,16 @@ type reportData struct {
 	Good              int
 	Failed            int
 	ValidationFailed  int
+	Skipped           int
+	Unverified        int
+	IsEEST            bool   // the run contains zkevm fixtures
+	UnitColumn        string // header for the first Raw Data column
+	UnitAxis          string // chart x-axis title
+	Scaled            bool   // too many units for per-unit charts
+	ScaleNote         string
+	RankCosts         template.JS // sorted total costs, rank on x
+	SuiteLabels       template.JS
+	SuiteMedians      template.JS
 	StatRows          []statRow
 	Labels            template.JS
 	ElapsedMs         template.JS // outer wall-clock ms per block (both targets)
@@ -412,10 +472,26 @@ type reportData struct {
 	ExecFailed        []execFailedRow
 	ValidationFails   []validationFailRow
 	Errors            []errorRow
+	Skips             []skipRow
+	Unverifieds       []skipRow
 	RawBlocks         []rawBlockRow
 }
 
+// skipRow backs both the Skipped and the Unverified tables: a unit that is
+// neither a pass nor a failure, plus why.
+type skipRow struct {
+	Unit    string
+	Suite   string
+	Network string
+	Reason  string
+}
+
 type rawBlockRow struct {
+	// Unit is the first column: the EEST test label, or the corpus block
+	// number rendered as-is so corpus reports are unchanged.
+	Unit        string
+	Suite       string
+	Network     string
 	BlockNum    uint64
 	TxCount     int
 	GasUsed     uint64
@@ -436,19 +512,23 @@ type rawBlockRow struct {
 type execFailedRow struct {
 	BlockNum uint64
 	Name     string
+	Unit     string
 	Reason   string
 }
 
 type validationFailRow struct {
 	BlockNum        uint64
 	Name            string
+	Unit            string
 	ExpectedSuccess bool
 	ExecError       string
+	Reason          string
 }
 
 type errorRow struct {
 	BlockNum uint64
 	Name     string
+	Unit     string
 	ErrMsg   string
 	Output   string
 }
@@ -461,29 +541,84 @@ type statRow struct {
 	Avg   uint64
 }
 
+// maxChartUnits is where per-unit charts stop being useful. A stacked bar with
+// five datasets over 7,390 units hangs the browser, so above this the report
+// switches to aggregate views.
+const maxChartUnits = 1500
+
+// toJS marshals chart data. Going through encoding/json rather than string
+// concatenation is what makes EEST labels safe: they contain brackets, colons,
+// commas and quotes.
+func toJS(v any) template.JS {
+	b, err := json.Marshal(v)
+	// A nil slice marshals to "null", which would break every array method the
+	// charts call on it.
+	if err != nil || string(b) == "null" {
+		return template.JS("[]")
+	}
+	return template.JS(b)
+}
+
+// unitCell is the first-column identity of a row: the EEST test label, or the
+// corpus block number rendered exactly as it was before labels existed.
+func unitCell(r BlockResult) string {
+	if r.Kind == fixture.FormatZkevm {
+		return r.Label
+	}
+	return strconv.FormatUint(r.BlockNum, 10)
+}
+
+// suiteMedians returns each suite and its median total cost, ordered by suite.
+// For the benchmark fixtures that is the comparison that matters: the same
+// workload at 10M, 30M and 60M gas.
+func suiteMedians(good []BlockResult) ([]string, []uint64) {
+	bySuite := map[string][]uint64{}
+	for _, r := range good {
+		bySuite[r.Suite] = append(bySuite[r.Suite], r.Costs.Total)
+	}
+	names := make([]string, 0, len(bySuite))
+	for s := range bySuite {
+		names = append(names, s)
+	}
+	sort.Strings(names)
+	medians := make([]uint64, len(names))
+	for i, s := range names {
+		medians[i] = computeStats(bySuite[s]).P50
+	}
+	return names, medians
+}
+
 func writeReport(path string, good []BlockResult, all []BlockResult, target string) error {
 	total := len(all)
 
-	toJS := func(vs []uint64) template.JS {
-		var sb strings.Builder
-		sb.WriteByte('[')
-		for i, v := range vs {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			sb.WriteString(strconv.FormatUint(v, 10))
+	isEEST := false
+	for _, r := range all {
+		if r.Kind == fixture.FormatZkevm {
+			isEEST = true
+			break
 		}
-		sb.WriteByte(']')
-		return template.JS(sb.String())
 	}
 
 	blockNums := make([]uint64, len(good))
+	unitLabels := make([]string, len(good))
 	elapsedMs := make([]uint64, len(good))
 	instructionCounts := make([]uint64, len(good))
 	for i, r := range good {
 		blockNums[i] = r.BlockNum
+		unitLabels[i] = r.Label
 		elapsedMs[i] = uint64(r.Elapsed.Milliseconds())
 		instructionCounts[i] = r.Costs.Instructions
+	}
+
+	// Chart labels: corpus keeps its numeric axis (marshalling []uint64 gives
+	// exactly the array the old string concatenation produced), EEST gets
+	// strings. Concatenating EEST names by hand would break the report outright,
+	// since they contain brackets, colons, commas and quotes.
+	var chartLabels template.JS
+	if isEEST {
+		chartLabels = toJS(unitLabels)
+	} else {
+		chartLabels = toJS(blockNums)
 	}
 
 	extract := func(fn func(CostReport) uint64) []uint64 {
@@ -532,37 +667,56 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 			execFailedRows = append(execFailedRows, execFailedRow{
 				BlockNum: r.BlockNum,
 				Name:     r.Name,
+				Unit:     unitCell(r),
 				Reason:   r.ExecError,
 			})
 		}
-		if r.Err == nil && !r.ValidationOK {
+		if r.Err == nil && r.Verdict.Kind == verdictFail {
 			validationFailRows = append(validationFailRows, validationFailRow{
 				BlockNum:        r.BlockNum,
 				Name:            r.Name,
+				Unit:            unitCell(r),
 				ExpectedSuccess: r.ExpectedSuccess,
 				ExecError:       r.ExecError,
+				Reason:          r.Verdict.Reason,
 			})
 		}
 	}
-	sort.Slice(execFailedRows, func(i, j int) bool { return execFailedRows[i].BlockNum < execFailedRows[j].BlockNum })
-	sort.Slice(validationFailRows, func(i, j int) bool { return validationFailRows[i].BlockNum < validationFailRows[j].BlockNum })
+	sort.SliceStable(execFailedRows, func(i, j int) bool { return execFailedRows[i].Unit < execFailedRows[j].Unit })
+	sort.SliceStable(validationFailRows, func(i, j int) bool { return validationFailRows[i].Unit < validationFailRows[j].Unit })
 
 	var errRows []errorRow
+	var skipRows, unverifiedRows []skipRow
 	for _, r := range all {
 		if r.Err != nil {
 			errRows = append(errRows, errorRow{
 				BlockNum: r.BlockNum,
 				Name:     r.Name,
+				Unit:     unitCell(r),
 				ErrMsg:   r.Err.Error(),
 				Output:   r.ErrOutput,
 			})
 		}
+		// Skipped and unverified units get their own tables rather than joining
+		// the Errors table, so a mixed-fork tree does not render thousands of
+		// red rows.
+		switch r.Verdict.Kind {
+		case verdictSkip:
+			skipRows = append(skipRows, skipRow{unitCell(r), r.Suite, r.Network, r.Verdict.Reason})
+		case verdictUnverified:
+			unverifiedRows = append(unverifiedRows, skipRow{unitCell(r), r.Suite, r.Network, r.Verdict.Reason})
+		}
 	}
-	sort.Slice(errRows, func(i, j int) bool { return errRows[i].BlockNum < errRows[j].BlockNum })
+	sort.SliceStable(errRows, func(i, j int) bool { return errRows[i].Unit < errRows[j].Unit })
+	sort.SliceStable(skipRows, func(i, j int) bool { return skipRows[i].Unit < skipRows[j].Unit })
+	sort.SliceStable(unverifiedRows, func(i, j int) bool { return unverifiedRows[i].Unit < unverifiedRows[j].Unit })
 
 	rawBlocks := make([]rawBlockRow, len(good))
 	for i, r := range good {
 		row := rawBlockRow{
+			Unit:        unitCell(r),
+			Suite:       r.Suite,
+			Network:     r.Network,
 			BlockNum:    r.BlockNum,
 			TxCount:     r.TxCount,
 			GasUsed:     r.GasUsed,
@@ -582,6 +736,30 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		rawBlocks[i] = row
 	}
 
+	unitColumn, unitAxis := "Block", "Block Number"
+	if isEEST {
+		unitColumn, unitAxis = "Test", "Test"
+	}
+
+	// Above maxChartUnits, per-unit charts are replaced by a rank-ordered cost
+	// curve and a per-suite median bar. The swap is stated in the report rather
+	// than left for the reader to infer from a missing chart.
+	scaled := len(good) > maxChartUnits
+	var (
+		scaleNote  string
+		rankCosts  []uint64
+		suiteNames []string
+		suiteMeds  []uint64
+	)
+	if scaled {
+		scaleNote = fmt.Sprintf(
+			"%d units exceeds the %d-unit per-unit chart limit; showing the cost distribution and per-suite medians instead.",
+			len(good), maxChartUnits)
+		rankCosts = extract(func(c CostReport) uint64 { return c.Total })
+		sort.Slice(rankCosts, func(i, j int) bool { return rankCosts[i] < rankCosts[j] })
+		suiteNames, suiteMeds = suiteMedians(good)
+	}
+
 	data := reportData{
 		Generated:         time.Now().Format(time.RFC1123),
 		Target:            target,
@@ -590,7 +768,17 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		Failed:            len(execFailedRows),
 		ValidationFailed:  len(validationFailRows),
 		StatRows:          statRows,
-		Labels:            toJS(blockNums),
+		Skipped:           len(skipRows),
+		Unverified:        len(unverifiedRows),
+		IsEEST:            isEEST,
+		UnitColumn:        unitColumn,
+		UnitAxis:          unitAxis,
+		Scaled:            scaled,
+		ScaleNote:         scaleNote,
+		RankCosts:         toJS(rankCosts),
+		SuiteLabels:       toJS(suiteNames),
+		SuiteMedians:      toJS(suiteMeds),
+		Labels:            chartLabels,
 		ElapsedMs:         toJS(elapsedMs),
 		InstructionCounts: toJS(instructionCounts),
 		TotalCosts:        toJS(extract(func(c CostReport) uint64 { return c.Total })),
@@ -602,6 +790,8 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		ExecFailed:        execFailedRows,
 		ValidationFails:   validationFailRows,
 		Errors:            errRows,
+		Skips:             skipRows,
+		Unverifieds:       unverifiedRows,
 		RawBlocks:         rawBlocks,
 	}
 
@@ -644,7 +834,7 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 </head>
 <body>
 <h1>zesu-zkvm Benchmark Report <span class="target-badge">{{.Target}}</span></h1>
-<p class="meta">Generated: {{.Generated}} &nbsp;|&nbsp; Blocks: {{.Good}}/{{.Total}} succeeded{{if .ValidationFailed}} &nbsp;|&nbsp; <span style="color:#dc3545">{{.ValidationFailed}} validation failure(s)</span>{{end}}{{if .Failed}} &nbsp;|&nbsp; {{.Failed}} expected failure(s){{end}}</p>
+<p class="meta">Generated: {{.Generated}} &nbsp;|&nbsp; Blocks: {{.Good}}/{{.Total}} succeeded{{if .ValidationFailed}} &nbsp;|&nbsp; <span style="color:#dc3545">{{.ValidationFailed}} validation failure(s)</span>{{end}}{{if .Failed}} &nbsp;|&nbsp; {{.Failed}} expected failure(s){{end}}{{if .Unverified}} &nbsp;|&nbsp; {{.Unverified}} unverified{{end}}{{if .Skipped}} &nbsp;|&nbsp; {{.Skipped}} skipped{{end}}</p>
 
 <h2>Summary</h2>
 <table>
@@ -662,6 +852,15 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   </tbody>
 </table>
 
+{{if .Scaled}}
+<p class="meta">{{.ScaleNote}}</p>
+
+<h2>Total Cost Distribution (sorted by rank)</h2>
+<div class="chart-wrap"><canvas id="rankChart"></canvas></div>
+
+<h2>Median Total Cost by Suite</h2>
+<div class="chart-wrap"><canvas id="suiteChart"></canvas></div>
+{{else}}
 {{if eq .Target "openvm"}}
 <h2>Instruction Count by Block</h2>
 <div class="chart-wrap"><canvas id="instructionChart"></canvas></div>
@@ -677,17 +876,18 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 <h2>Cost Breakdown by Block</h2>
 <div class="chart-wrap"><canvas id="stackedChart"></canvas></div>
 {{end}}
+{{end}}
 
 {{if .ValidationFails}}
 <h2>Validation Failures ({{len .ValidationFails}} blocks)</h2>
 <table id="validationFailTable">
-  <thead><tr><th>Block</th><th>Expected</th><th>Got</th></tr></thead>
+  <thead><tr><th>{{.UnitColumn}}</th><th>Expected</th><th>Got</th></tr></thead>
   <tbody>
   {{range .ValidationFails}}
   <tr>
-    <td style="white-space:nowrap;font-family:monospace">{{.BlockNum}}</td>
+    <td style="white-space:nowrap;font-family:monospace">{{.Unit}}</td>
     <td>{{if .ExpectedSuccess}}success{{else}}failure{{end}}</td>
-    <td style="color:#dc3545">{{if .ExecError}}failed: {{.ExecError}}{{else}}success{{end}}</td>
+    <td style="color:#dc3545">{{if .Reason}}{{.Reason}}{{else}}{{if .ExecError}}failed: {{.ExecError}}{{else}}success{{end}}{{end}}</td>
   </tr>
   {{end}}
   </tbody>
@@ -697,11 +897,11 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 {{if .ExecFailed}}
 <h2>Expected Failures ({{len .ExecFailed}} blocks)</h2>
 <table id="execFailTable">
-  <thead><tr><th>Block</th><th>Reason</th></tr></thead>
+  <thead><tr><th>{{.UnitColumn}}</th><th>Reason</th></tr></thead>
   <tbody>
   {{range .ExecFailed}}
   <tr>
-    <td style="white-space:nowrap;font-family:monospace">{{.BlockNum}}</td>
+    <td style="white-space:nowrap;font-family:monospace">{{.Unit}}</td>
     <td style="font-family:monospace;color:#6c757d">{{.Reason}}</td>
   </tr>
   {{end}}
@@ -712,11 +912,11 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 {{if .Errors}}
 <h2>Errors ({{len .Errors}} blocks)</h2>
 <table id="errTable">
-  <thead><tr><th>Block</th><th>Error</th></tr></thead>
+  <thead><tr><th>{{.UnitColumn}}</th><th>Error</th></tr></thead>
   <tbody>
   {{range .Errors}}
   <tr>
-    <td style="white-space:nowrap">{{.BlockNum}}</td>
+    <td style="white-space:nowrap">{{.Unit}}</td>
     <td>
       <details>
         <summary style="cursor:pointer;font-family:monospace">{{.ErrMsg}}</summary>
@@ -729,15 +929,49 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 </table>
 {{end}}
 
+{{if .Unverifieds}}
+<h2>Unverified ({{len .Unverifieds}} units)</h2>
+<p class="meta">Ran, but the fixture carries no expected output to compare against — neither a pass nor a failure.</p>
+<table id="unverifiedTable" style="max-width:1100px">
+  <thead><tr><th>{{.UnitColumn}}</th><th>Network</th><th>Reason</th></tr></thead>
+  <tbody>
+  {{range .Unverifieds}}
+  <tr>
+    <td style="font-family:monospace">{{.Unit}}</td>
+    <td>{{.Network}}</td>
+    <td style="color:#6c757d">{{.Reason}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+{{if .Skips}}
+<h2>Skipped ({{len .Skips}} units)</h2>
+<p class="meta">Not runnable by this tool — no stateless input in the fixture.</p>
+<table id="skipTable" style="max-width:1100px">
+  <thead><tr><th>{{.UnitColumn}}</th><th>Network</th><th>Reason</th></tr></thead>
+  <tbody>
+  {{range .Skips}}
+  <tr>
+    <td style="font-family:monospace">{{.Unit}}</td>
+    <td>{{.Network}}</td>
+    <td style="color:#6c757d">{{.Reason}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
 {{if .RawBlocks}}
 <h2>Raw Block Data</h2>
-<input id="rawSearch" type="text" placeholder="Filter by block number..." style="margin-bottom:.5rem;padding:.3rem .6rem;font-size:.9rem;border:1px solid #dee2e6;border-radius:4px;width:220px">
+<input id="rawSearch" type="text" placeholder="Filter by {{if .IsEEST}}test name{{else}}block number{{end}}..." style="margin-bottom:.5rem;padding:.3rem .6rem;font-size:.9rem;border:1px solid #dee2e6;border-radius:4px;width:220px">
 <label style="margin-left:.75rem;font-size:.9rem;cursor:pointer"><input type="checkbox" id="failOnly" style="margin-right:.3rem">Failures only</label>
 <div style="overflow-x:auto;max-width:100%">
 <table id="rawTable" style="font-size:.82rem;min-width:900px">
   <thead>
   <tr>
-    <th onclick="sortTable(0)" style="cursor:pointer;white-space:nowrap">Block ↕</th>
+    <th onclick="sortTable(0)" style="cursor:pointer;white-space:nowrap">{{.UnitColumn}} ↕</th>
     <th onclick="sortTable(1)" style="cursor:pointer">TxCount ↕</th>
     <th onclick="sortTable(2)" style="cursor:pointer">GasUsed ↕</th>
     <th onclick="sortTable(3)" style="cursor:pointer">Base ↕</th>
@@ -753,7 +987,7 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   <tbody id="rawBody">
   {{range .RawBlocks}}
   <tr{{if not .Success}} class="row-fail"{{end}}>
-    <td style="font-family:monospace">{{.BlockNum}}</td>
+    <td style="font-family:monospace">{{.Unit}}</td>
     <td>{{.TxCount}}</td>
     <td>{{.GasUsed}}</td>
     <td>{{.Base}}</td>
@@ -773,6 +1007,9 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 
 <script>
 const labels             = {{.Labels}};
+const rankCosts          = {{.RankCosts}};
+const suiteLabels        = {{.SuiteLabels}};
+const suiteMedians       = {{.SuiteMedians}};
 const elapsedMs          = {{.ElapsedMs}};
 const instructionCounts  = {{.InstructionCounts}};
 const totalCosts         = {{.TotalCosts}};
@@ -782,7 +1019,47 @@ const opCosts    = {{.OpCosts}};
 const preCosts   = {{.PreCosts}};
 const memCosts   = {{.MemCosts}};
 
-{{if eq .Target "openvm"}}
+{{if .Scaled}}
+new Chart(document.getElementById('rankChart'), {
+  type: 'line',
+  data: {
+    labels: rankCosts.map((_, i) => i + 1),
+    datasets: [{
+      label: 'TOTAL COST',
+      data: rankCosts,
+      borderColor: '#0d6efd',
+      backgroundColor: 'rgba(13,110,253,0.08)',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      fill: true,
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { title: { display: true, text: 'Unit rank (cheapest to most expensive)' } },
+      y: { title: { display: true, text: 'Cost' }, beginAtZero: true }
+    }
+  }
+});
+
+new Chart(document.getElementById('suiteChart'), {
+  type: 'bar',
+  data: {
+    labels: suiteLabels,
+    datasets: [{ label: 'Median TOTAL COST', data: suiteMedians, backgroundColor: '#198754' }]
+  },
+  options: {
+    responsive: true,
+    indexAxis: 'y',
+    plugins: { legend: { display: false } },
+    scales: { x: { title: { display: true, text: 'Cost' }, beginAtZero: true } }
+  }
+});
+{{end}}
+
+{{if and (not .Scaled) (eq .Target "openvm")}}
 new Chart(document.getElementById('instructionChart'), {
   type: 'line',
   data: {
@@ -809,6 +1086,7 @@ new Chart(document.getElementById('instructionChart'), {
 });
 {{end}}
 
+{{if not .Scaled}}
 new Chart(document.getElementById('elapsedChart'), {
   type: 'line',
   data: {
@@ -828,11 +1106,12 @@ new Chart(document.getElementById('elapsedChart'), {
     responsive: true,
     plugins: { legend: { display: false } },
     scales: {
-      x: { title: { display: true, text: 'Block Number' } },
+      x: { title: { display: true, text: '{{.UnitAxis}}' } },
       y: { title: { display: true, text: 'ms' }, beginAtZero: true }
     }
   }
 });
+{{end}}
 
 let sortDir = {};
 function sortTable(col) {
@@ -865,7 +1144,7 @@ function applyRawFilters() {
 if (rawSearch) rawSearch.addEventListener('input', applyRawFilters);
 if (failOnly) failOnly.addEventListener('change', applyRawFilters);
 
-{{if eq .Target "zisk"}}
+{{if and (not .Scaled) (eq .Target "zisk")}}
 new Chart(document.getElementById('totalChart'), {
   type: 'line',
   data: {
