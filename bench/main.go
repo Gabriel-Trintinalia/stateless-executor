@@ -271,14 +271,19 @@ func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
 	txs := f.StatelessInput.Block.Body.Transactions
 	bi.TxCount = len(txs)
 	for _, tx := range txs {
+		// The keys are capitalised, matching buildTx in fixture/encode.go, which
+		// errors on any other spelling — so a fixture that encodes at all uses
+		// these. They were previously lowercase and therefore always missed,
+		// which is why every transaction was counted as legacy and four of the
+		// CSV columns were always zero.
 		switch {
-		case tx.Transaction["eip1559"] != nil:
+		case tx.Transaction["Eip1559"] != nil:
 			bi.Eip1559Txs++
-		case tx.Transaction["eip4844"] != nil:
+		case tx.Transaction["Eip4844"] != nil:
 			bi.Eip4844Txs++
-		case tx.Transaction["eip2930"] != nil:
+		case tx.Transaction["Eip2930"] != nil:
 			bi.Eip2930Txs++
-		case tx.Transaction["eip7702"] != nil:
+		case tx.Transaction["Eip7702"] != nil:
 			bi.Eip7702Txs++
 		default:
 			bi.LegacyTxs++
