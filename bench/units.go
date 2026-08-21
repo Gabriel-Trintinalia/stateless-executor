@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,7 @@ type unitMeta struct {
 	BlockNum uint64 // corpus: the mainnet block number; EEST: the header number
 	Suite    string
 	Network  string
+	Kind     fixture.Format
 	Info     blockInfo // pre-filled where the format allows it; else from Encode
 }
 
@@ -93,6 +95,8 @@ func expand(j fileJob) ([]unit, error) {
 	switch j.Kind {
 	case fixture.FormatCorpus:
 		return expandCorpus(j)
+	case fixture.FormatZkevm:
+		return expandEEST(j)
 	default:
 		return nil, fmt.Errorf("%s: unsupported fixture format %s", j.Path, j.Kind)
 	}
@@ -112,6 +116,7 @@ func expandCorpus(j fileJob) ([]unit, error) {
 			Label:    name,
 			BlockNum: extractBlockNum(name),
 			Suite:    j.Suite,
+			Kind:     j.Kind,
 		},
 		Encode: func() (encoded, error) {
 			f, err := fixture.LoadFile(path)
@@ -133,6 +138,157 @@ func expandCorpus(j fileJob) ([]unit, error) {
 	}}, nil
 }
 
+// expandEEST parses one EEST blockchain-test file and returns a unit per block
+// across all its test cases.
+//
+// The file is parsed once here, not once per block. Metadata needs no SSZ
+// decoding: the JSON carries blockHeader.number, blockHeader.gasUsed and
+// transactions[].type directly, so Meta is fully populated up front and Encode
+// is a trivial re-encode of already-in-memory hex.
+func expandEEST(j fileJob) ([]unit, error) {
+	tcs, err := fixture.LoadZkevmFile(j.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	var units []unit
+	for _, tc := range tcs {
+		for bi := range tc.Blocks {
+			block := &tc.Blocks[bi]
+
+			// Label must match cmd/zkevm-runner's exactly, so the two tools'
+			// pass/fail sets can be cross-checked by label.
+			label := tc.Name
+			if len(tc.Blocks) > 1 {
+				label = fmt.Sprintf("%s/block%d", tc.Name, bi)
+			}
+
+			units = append(units, unit{
+				Meta: unitMeta{
+					Label:    label,
+					BlockNum: block.Number(),
+					Suite:    j.Suite,
+					Network:  tc.Network,
+					Kind:     j.Kind,
+					Info:     eestBlockInfo(block),
+				},
+				Encode: func() (encoded, error) {
+					// The second return of ZesuInputFromZkevmBlock is
+					// ExpectException == "", which is NOT the expectation this
+					// tool validates against. Discard it deliberately.
+					input, _, err := fixture.ZesuInputFromZkevmBlock(tc, block)
+					enc := encoded{
+						Input:             input,
+						Info:              eestBlockInfo(block),
+						ExpectedOutputHex: normaliseHex(block.StatelessOutputBytes),
+					}
+					// The authoritative expectation is byte 32 of the fixture's
+					// own SszStatelessValidationResult, not expectException.
+					enc.ExpectedSuccess = expectedSuccessFromOutput(enc.ExpectedOutputHex)
+					if err != nil {
+						return enc, err
+					}
+					return enc, nil
+				},
+				Verify: verifyEEST,
+			})
+		}
+	}
+	return units, nil
+}
+
+func eestBlockInfo(b *fixture.ZkevmBlock) blockInfo {
+	info := blockInfo{
+		TxCount: len(b.Transactions),
+		GasUsed: b.GasUsed(),
+	}
+	for _, tx := range b.Transactions {
+		switch strings.ToLower(strings.TrimPrefix(tx.Type, "0x")) {
+		case "01":
+			info.Eip2930Txs++
+		case "02":
+			info.Eip1559Txs++
+		case "03":
+			info.Eip4844Txs++
+		case "04":
+			info.Eip7702Txs++
+		default: // "00", "" or absent
+			info.LegacyTxs++
+		}
+	}
+	return info
+}
+
+func normaliseHex(s string) string {
+	return strings.ToLower(strings.TrimPrefix(s, "0x"))
+}
+
+// expectedSuccessFromOutput reads the expectation out of the fixture's own
+// expected output: byte 32 of SszStatelessValidationResult is
+// successful_validation.
+func expectedSuccessFromOutput(expectedOutputHex string) bool {
+	return len(expectedOutputHex) < 66 || expectedOutputHex[64:66] != "00"
+}
+
+// verifyEEST is the EEST rule: the SSZ output bytes are the authoritative
+// pass/fail signal.
+//
+// It does NOT consult ExpectException. expectedSuccess comes from the fixture's
+// SszStatelessValidationResult byte 32 (successful_validation), not from the
+// block-level expectException field: a block can carry an expectException such
+// as INVALID_BLOCK_ACCESS_LIST or INVALID_REQUESTS and still have a fixture
+// output that says the stateless validation itself succeeded. Comparing the
+// output bytes is what keeps those cases honest.
+//
+// execErr is display-only here. An expected-invalid block legitimately prints
+// "error: execution failed: X", exits 0, and matches its expected output;
+// letting execErr into the verdict would manufacture thousands of false
+// failures.
+func verifyEEST(enc encoded, r emuResult, runErr error) verdict {
+	v := verdict{
+		Mode:              "output-bytes",
+		ExpectedSuccess:   enc.ExpectedSuccess,
+		ExpectedOutputHex: enc.ExpectedOutputHex,
+		GotOutputHex:      r.OutputHex,
+	}
+
+	if errors.Is(runErr, fixture.ErrMissingStatelessInputBytes) {
+		v.Kind = verdictSkip
+		v.Reason = "no statelessInputBytes"
+		return v
+	}
+	if runErr != nil {
+		v.Kind = verdictError
+		v.Reason = runErr.Error()
+		return v
+	}
+
+	// ziskemu's -o writes the full output region, zero-padded, so trim got to
+	// expected's length before comparing.
+	got := normaliseHex(r.OutputHex)
+	if len(v.ExpectedOutputHex) > 0 && len(got) > len(v.ExpectedOutputHex) {
+		got = got[:len(v.ExpectedOutputHex)]
+	}
+	v.GotSuccess = expectedSuccessFromOutput(got)
+
+	// A fixture with no expected output cannot be validated. Upstream this
+	// short-circuited to an unconditional pass, which silently hid the gap.
+	if v.ExpectedOutputHex == "" {
+		v.Kind = verdictUnverified
+		v.Reason = "fixture has no statelessOutputBytes"
+		return v
+	}
+
+	v.OutputMatch = got == v.ExpectedOutputHex
+	if !v.OutputMatch {
+		v.Kind = verdictFail
+		v.Reason = "output mismatch"
+		return v
+	}
+	v.Kind = verdictPass
+	return v
+}
+
 // verifyCorpus is the corpus rule, unchanged: the guest's success is compared
 // against the fixture's `success` flag.
 func verifyCorpus(enc encoded, r emuResult, runErr error) verdict {
@@ -150,7 +306,8 @@ func verifyCorpus(enc encoded, r emuResult, runErr error) verdict {
 	}
 	if gotSuccess != enc.ExpectedSuccess {
 		v.Kind = verdictFail
-		v.Reason = fmt.Sprintf("expected success=%v, got success=%v", enc.ExpectedSuccess, gotSuccess)
+		// Phrased to keep the progress line byte-identical to the pre-unit output.
+		v.Reason = fmt.Sprintf("expected success=%v", enc.ExpectedSuccess)
 		return v
 	}
 	v.Kind = verdictPass

@@ -122,6 +122,15 @@ func suiteOf(root, path string) string {
 	return rel
 }
 
+func hasKind(jobs []fileJob, k fixture.Format) bool {
+	for _, j := range jobs {
+		if j.Kind == k {
+			return true
+		}
+	}
+	return false
+}
+
 // maxSuitesShown bounds the --dry-run suite listing. A spec-tests tree has
 // ~14k suites; printing them all buries the census. Truncation is always
 // reported, never silent.

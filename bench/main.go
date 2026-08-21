@@ -47,6 +47,7 @@ type BlockResult struct {
 	Label           string // unit label: corpus file stem, or EEST test-case name[/blockN]
 	Suite           string // fixture dir relative to the fixtures root
 	Network         string // EEST only; "" for corpus
+	Kind            fixture.Format
 	Verdict         verdict
 	Target          string // "zisk" or "openvm"
 	Costs           CostReport
@@ -124,12 +125,20 @@ func main() {
 		log.Fatalf("no runnable JSON fixtures found in %s (%d skipped)", *fixturesDir, len(skipped))
 	}
 
-	// EEST support lands in a later step; until then refuse rather than
-	// mis-running a zkevm fixture through the corpus loader.
-	for _, j := range jobsFound {
-		if j.Kind != fixture.FormatCorpus {
-			log.Fatalf("%s: %s fixtures are not runnable yet (use --dry-run to inspect)", j.Path, j.Kind)
+	// OpenVM's verdict comes from a fixed-offset read of the output region and
+	// has no EEST equivalent, so refuse the combination up front rather than
+	// mis-reporting thousands of units. The formats are known from discovery.
+	if *targetFlag == "openvm" {
+		for _, j := range jobsFound {
+			if j.Kind != fixture.FormatCorpus {
+				log.Fatalf("%s: --target openvm does not support %s fixtures", j.Path, j.Kind)
+			}
 		}
+	}
+	// A mixed run is well-defined but its summary statistics span two
+	// incomparable populations, so warn rather than refuse.
+	if hasKind(jobsFound, fixture.FormatCorpus) && hasKind(jobsFound, fixture.FormatZkevm) {
+		log.Printf("WARNING: mixed corpus and zkevm fixtures — summary statistics span both and are not meaningful")
 	}
 
 	log.Printf("found %d fixtures, running with %s/%s (%d job(s))...", len(jobsFound), *targetFlag, *zkvmPath, *jobs)

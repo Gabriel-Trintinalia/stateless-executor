@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Gabriel-Trintinalia/stateless-executor/fixture"
 )
 
 // emuRunner executes one already-encoded input. The zisk and openvm targets
@@ -96,6 +98,7 @@ func runUnit(u unit, run emuRunner, target string, p *progress) BlockResult {
 		Label:           u.Meta.Label,
 		Suite:           u.Meta.Suite,
 		Network:         u.Meta.Network,
+		Kind:            u.Meta.Kind,
 		Target:          target,
 		Elapsed:         elapsed,
 		ExpectedSuccess: v.ExpectedSuccess,
@@ -110,9 +113,13 @@ func runUnit(u unit, run emuRunner, target string, p *progress) BlockResult {
 		Eip4844Txs:      info.Eip4844Txs,
 		Eip7702Txs:      info.Eip7702Txs,
 	}
-	// A failed run reports no costs and no exec error, so a partial cost table
-	// can never reach the statistics or the charts.
-	if runErr != nil {
+	// Only a verdictError is an error row. A skipped or unverified unit is
+	// neither a pass nor a failure, and must not land in the Errors table —
+	// otherwise a mixed-fork tree renders thousands of red rows.
+	//
+	// An errored run also reports no costs and no exec error, so a partial cost
+	// table can never reach the statistics or the charts.
+	if v.Kind == verdictError {
 		res.Err = runErr
 		res.ErrOutput = r.RawOut
 	} else {
@@ -132,20 +139,29 @@ func printProgress(res BlockResult, p *progress, target string) {
 		costSuffix = fmt.Sprintf("  total=%d", res.Costs.Total)
 	}
 
+	// Corpus units are identified by block number, as they always have been.
+	// EEST block numbers are all 1 or 2 within a fixture and say nothing about
+	// which test ran, so those are identified by label instead.
+	subject := fmt.Sprintf("block %d", res.BlockNum)
+	if res.Kind == fixture.FormatZkevm {
+		subject = res.Label
+	}
+
 	switch {
-	case res.Err != nil:
-		fmt.Printf("[%3d/%d] ERROR %-40s  %v\n", n, total, res.Name, res.Err)
 	case res.Verdict.Kind == verdictSkip:
 		fmt.Printf("[%3d/%d] SKIP %s: %s\n", n, total, res.Label, res.Verdict.Reason)
+	case res.Err != nil:
+		fmt.Printf("[%3d/%d] ERROR %-40s  %v\n", n, total, res.Name, res.Err)
 	case res.Verdict.Kind == verdictUnverified:
-		fmt.Printf("[%3d/%d] %s%s  UNVERIFIED: %s  (%s)\n", n, total, res.Label, costSuffix, res.Verdict.Reason, res.Elapsed.Round(time.Millisecond))
+		fmt.Printf("[%3d/%d] %s%s  UNVERIFIED: %s  (%s)\n",
+			n, total, subject, costSuffix, res.Verdict.Reason, res.Elapsed.Round(time.Millisecond))
 	case !res.ValidationOK:
-		fmt.Printf("[%3d/%d] block %d%s  VALIDATION FAILED (expected success=%v)  (%s)\n",
-			n, total, res.BlockNum, costSuffix, res.ExpectedSuccess, res.Elapsed.Round(time.Millisecond))
+		fmt.Printf("[%3d/%d] %s%s  VALIDATION FAILED (%s)  (%s)\n",
+			n, total, subject, costSuffix, res.Verdict.Reason, res.Elapsed.Round(time.Millisecond))
 	case res.ExecError != "":
-		fmt.Printf("[%3d/%d] block %d%s  EXEC FAILED (expected): %s  (%s)\n",
-			n, total, res.BlockNum, costSuffix, res.ExecError, res.Elapsed.Round(time.Millisecond))
+		fmt.Printf("[%3d/%d] %s%s  EXEC FAILED (expected): %s  (%s)\n",
+			n, total, subject, costSuffix, res.ExecError, res.Elapsed.Round(time.Millisecond))
 	default:
-		fmt.Printf("[%3d/%d] block %d%s  (%s)\n", n, total, res.BlockNum, costSuffix, res.Elapsed.Round(time.Millisecond))
+		fmt.Printf("[%3d/%d] %s%s  (%s)\n", n, total, subject, costSuffix, res.Elapsed.Round(time.Millisecond))
 	}
 }
