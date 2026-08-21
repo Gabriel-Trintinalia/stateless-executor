@@ -143,14 +143,30 @@ func main() {
 		log.Fatalf("no runnable units across %d file(s)", len(jobsFound))
 	}
 
+	// good is the population the cost statistics and the charts are computed
+	// over: units that actually ran and produced a cost table. Skipped units
+	// never ran, so including them would report a real workload of zero cost and
+	// count each one as a validation failure. Errored units are excluded for the
+	// same reason — their cost tables are truncated or absent.
 	var good []BlockResult
 	var validationFailures []BlockResult
+	var skippedUnits, unverified int
 	for _, r := range results {
-		if r.Err == nil {
+		switch r.Verdict.Kind {
+		case verdictSkip:
+			skippedUnits++
+		case verdictError:
+			// Already surfaced through r.Err and the Errors table.
+		case verdictFail:
 			good = append(good, r)
-			if !r.ValidationOK {
-				validationFailures = append(validationFailures, r)
-			}
+			validationFailures = append(validationFailures, r)
+		case verdictUnverified:
+			// Measured but not validated: its costs are real, so it belongs in
+			// the statistics, but it is not a failure.
+			unverified++
+			good = append(good, r)
+		default:
+			good = append(good, r)
 		}
 	}
 	sortResults(good)
@@ -158,10 +174,16 @@ func main() {
 	if len(good) > 0 {
 		printSummary(good, len(results), len(validationFailures), *targetFlag)
 	} else {
-		log.Printf("WARNING: no successful results — report will contain errors only")
+		log.Printf("WARNING: no units produced costs — report will contain errors and skips only")
 	}
 	if len(validationFailures) > 0 {
-		log.Printf("VALIDATION FAILURES: %d block(s) had unexpected execution outcome", len(validationFailures))
+		log.Printf("VALIDATION FAILURES: %d unit(s) had unexpected execution outcome", len(validationFailures))
+	}
+	if unverified > 0 {
+		log.Printf("UNVERIFIED: %d unit(s) ran but carry no expected output to compare against", unverified)
+	}
+	if skippedUnits > 0 {
+		log.Printf("SKIPPED: %d unit(s) had no stateless input to run", skippedUnits)
 	}
 
 	if err := writeReport(*reportPath, good, results, *targetFlag); err != nil {

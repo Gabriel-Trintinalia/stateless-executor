@@ -90,8 +90,10 @@ func discover(root string) ([]fileJob, []skippedFile, error) {
 			return nil
 		}
 
+		// os.Stat, not d.Info: DirEntry does not follow symlinks, so a linked
+		// fixture would be reported as the size of the link.
 		var size int64
-		if fi, err := d.Info(); err == nil {
+		if fi, err := os.Stat(path); err == nil {
 			size = fi.Size()
 		}
 		jobs = append(jobs, fileJob{
