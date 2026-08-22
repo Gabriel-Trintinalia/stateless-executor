@@ -64,7 +64,7 @@ func main() {
 	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM)")
 	jobs := flag.Int("jobs", 1, "number of parallel emulator runs")
 	reportPath := flag.String("report", "bench_report.html", "output HTML report path")
-	csvPath := flag.String("csv", "", "optional path to write per-block CSV (block_num,tx_count,gas_used,legacy,eip1559,eip2930,eip4844,eip7702,base,main,opcodes,precompiles,memory,total,elapsed_ms)")
+	csvPath := flag.String("csv", "", "optional path to write a per-unit CSV; see csvHeader for the columns")
 	dryRun := flag.Bool("dry-run", false, "discover fixtures, print the per-format census, and exit without running the emulator")
 	maxSteps := flag.Uint64("maxSteps", 0, "emulator step cap, passed as -n; 0 leaves the emulator on its default (68719476735)")
 	flag.Parse()
@@ -211,6 +211,15 @@ type blockInfo struct {
 	OutputHex  string
 }
 
+// boolCell renders a flag as 1/0, matching the otherwise numeric CSV rather
+// than introducing a true/false literal.
+func boolCell(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
 // sortResults orders rows for the CSV and the report.
 //
 // Corpus rows sort by block number — not by label, which sorts wrong across the
@@ -235,6 +244,34 @@ func sortResults(rs []BlockResult) {
 	})
 }
 
+// statelessOutput is the guest's decoded verdict region.
+//
+// zkevm@v0.8.0: SszStatelessValidationResult is a flat 43 bytes —
+// root(32) ‖ valid(1) ‖ chain_id(8, LE) ‖ schema_id(2, LE).
+type statelessOutput struct {
+	PayloadRoot string // hex of out[0:32]: new_payload_request_root
+	Success     bool   // out[32]: 0x01 = valid
+	ChainID     uint64 // out[33:41]
+	SchemaID    uint16 // out[41:43]
+	OK          bool   // the region was present and long enough to decode
+}
+
+// decodeStatelessOutput parses the hex output region. A short or unparsable
+// region yields OK false and a zero value, never a partial decode.
+func decodeStatelessOutput(outputHex string) statelessOutput {
+	b, err := hex.DecodeString(outputHex)
+	if err != nil || len(b) < statelessOutputSize {
+		return statelessOutput{}
+	}
+	return statelessOutput{
+		PayloadRoot: hex.EncodeToString(b[0:32]),
+		Success:     b[32] == 0x01,
+		ChainID:     binary.LittleEndian.Uint64(b[33:41]),
+		SchemaID:    binary.LittleEndian.Uint16(b[41:43]),
+		OK:          true,
+	}
+}
+
 // csvHeader is the column order. New columns are appended rather than
 // interleaved, so the first fifteen fields are unchanged and positional
 // accessors into the archived runs ($14 total, $15 elapsed_ms) keep working.
@@ -242,7 +279,7 @@ var csvHeader = []string{
 	"block_num", "tx_count", "gas_used",
 	"legacy", "eip1559", "eip2930", "eip4844", "eip7702",
 	"base", "main", "opcodes", "precompiles", "memory", "total", "elapsed_ms",
-	"steps", "suite", "label",
+	"steps", "suite", "label", "payload_root", "success",
 }
 
 // writeCSV uses encoding/csv because EEST labels contain commas, brackets and
@@ -261,6 +298,7 @@ func writeCSV(path string, results []BlockResult) error {
 	}
 	u := func(v uint64) string { return strconv.FormatUint(v, 10) }
 	for _, r := range results {
+		out := decodeStatelessOutput(r.OutputHex)
 		if err := w.Write([]string{
 			u(r.BlockNum),
 			strconv.Itoa(r.TxCount),
@@ -280,6 +318,11 @@ func writeCSV(path string, results []BlockResult) error {
 			u(r.Costs.Steps),
 			r.Suite,
 			r.Label,
+			// The guest's verdict, so a run's CSV alone reproduces its report.
+			// These are the only two output fields the report renders; chain_id
+			// and schema_id are decoded but never displayed.
+			out.PayloadRoot,
+			boolCell(out.Success),
 		}); err != nil {
 			return err
 		}
@@ -720,11 +763,11 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 			Memory:      r.Costs.Memory,
 			Total:       r.Costs.Total,
 		}
-		if b, err := hex.DecodeString(r.OutputHex); err == nil && len(b) >= 43 {
-			row.PayloadRoot = hex.EncodeToString(b[0:32])
-			row.Success = b[32] == 0x01
-			row.ChainID = binary.LittleEndian.Uint64(b[33:41])
-			row.SchemaID = binary.LittleEndian.Uint16(b[41:43])
+		if o := decodeStatelessOutput(r.OutputHex); o.OK {
+			row.PayloadRoot = o.PayloadRoot
+			row.Success = o.Success
+			row.ChainID = o.ChainID
+			row.SchemaID = o.SchemaID
 		}
 		rawBlocks[i] = row
 	}

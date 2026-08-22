@@ -297,3 +297,88 @@ func mustRead(t *testing.T, p string) []byte {
 	}
 	return b
 }
+
+func TestDecodeStatelessOutput(t *testing.T) {
+	root := strings.Repeat("ab", 32)
+	full := root + "01" + "0100000000000000" + "0115"
+
+	o := decodeStatelessOutput(full)
+	if !o.OK || o.PayloadRoot != root || !o.Success {
+		t.Errorf("valid output decoded wrong: %+v", o)
+	}
+	if o.ChainID != 1 || o.SchemaID != 0x1501 {
+		t.Errorf("chain/schema = %d/%#x", o.ChainID, o.SchemaID)
+	}
+
+	if o := decodeStatelessOutput(root + "00" + "0100000000000000" + "0115"); o.Success {
+		t.Error("valid byte 0x00 must decode as failure")
+	}
+	// A short or absent region must yield nothing, never a partial decode that
+	// could read as a verdict.
+	for _, bad := range []string{"", root, root + "01", "zz"} {
+		if o := decodeStatelessOutput(bad); o.OK || o.Success || o.PayloadRoot != "" {
+			t.Errorf("input %q should not decode: %+v", bad, o)
+		}
+	}
+}
+
+// The point of these columns: a run's CSV alone must reproduce the identity of
+// its report's raw table, so a report never has to be rebuilt by scraping a
+// previous one.
+func TestWriteCSVCarriesTheGuestVerdict(t *testing.T) {
+	root := strings.Repeat("cd", 32)
+	rows := []BlockResult{
+		{ // validated
+			Kind: fixture.FormatZkevm, Label: "a::pass", Suite: "s", GasUsed: 10,
+			OutputHex: root + "01" + "0100000000000000" + "0115",
+		},
+		{ // guest reported invalid
+			Kind: fixture.FormatZkevm, Label: "b::fail", Suite: "s", GasUsed: 20,
+			OutputHex: root + "00" + "0100000000000000" + "0115",
+		},
+		{ // no output region at all
+			Kind: fixture.FormatZkevm, Label: "c::none", Suite: "s", GasUsed: 30,
+		},
+	}
+
+	p := filepath.Join(t.TempDir(), "out.csv")
+	if err := writeCSV(p, rows); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	recs, err := csv.NewReader(f).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iRoot, iOK := -1, -1
+	for i, h := range recs[0] {
+		switch h {
+		case "payload_root":
+			iRoot = i
+		case "success":
+			iOK = i
+		}
+	}
+	if iRoot < 0 || iOK < 0 {
+		t.Fatalf("payload_root/success missing from header: %v", recs[0])
+	}
+	// Appended, so the original fifteen keep their positions.
+	if recs[0][13] != "total" || recs[0][14] != "elapsed_ms" {
+		t.Errorf("existing columns moved: %v", recs[0][:15])
+	}
+
+	want := [][2]string{{root, "1"}, {root, "0"}, {"", "0"}}
+	for i, w := range want {
+		if got := recs[i+1][iRoot]; got != w[0] {
+			t.Errorf("row %d payload_root = %q, want %q", i, got, w[0])
+		}
+		if got := recs[i+1][iOK]; got != w[1] {
+			t.Errorf("row %d success = %q, want %q", i, got, w[1])
+		}
+	}
+}

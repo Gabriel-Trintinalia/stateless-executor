@@ -53,11 +53,17 @@ go run ./bench \
   Peak memory is bounded by roughly 2.6× the size of the files in flight — about 4.7 GB at `--jobs 8`
   over the benchmark tree, whose largest single fixture is 550 MB.
 - `--report` produces an HTML report; `--csv` writes per-unit stats. The CSV's first 15 columns are
-  unchanged from the archived `bench_*.csv` runs; `steps`, `suite` and `label` are appended after them.
-  `suite` is the fixture's directory relative to `--fixtures`, which for the benchmark trees gives you
-  the gas tier.
+  unchanged from the archived `bench_*.csv` runs; `steps`, `suite`, `label`, `payload_root` and
+  `success` are appended after them. `suite` is the fixture's directory relative to `--fixtures`, which
+  for the benchmark trees gives you the gas tier. `payload_root` and `success` are the guest's verdict,
+  so a run's CSV alone reproduces its report's raw table — they are the only two output fields the
+  report renders (`chain_id` and `schema_id` are decoded but never displayed).
 - Above 1,500 units the report replaces its per-unit charts with a cost-distribution curve and
-  per-suite medians, and says so.
+  per-suite medians, and says so. Over half of every EEST benchmark tier is zero-gas units — the
+  blockhash suites spend 256 empty history blocks per working block — which drags the blended median
+  far below the median of units that computed anything (333x on the 60M tier). Tick **Exclude zero-gas
+  units** in the report to recompute the stats and charts over the units that used gas; the CSV keeps
+  every unit, so filter on `gas_used` when analysing it directly.
 - `--maxSteps N` passes `-n` to the emulator. A run that reaches its step cap is reported as an error,
   never a pass: the emulator breaks out of its loop silently on `max_steps`, so a capped run otherwise
   looks like a cheap success with a truncated cost table. Detection also applies at ziskemu's own
