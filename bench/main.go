@@ -211,6 +211,18 @@ type blockInfo struct {
 	OutputHex  string
 }
 
+// suiteChartHeight sizes the per-suite bar chart so every category keeps a
+// readable tick label. With a fixed 400px canvas, 27 suites left ~15px each and
+// Chart.js silently dropped most labels via autoSkip, leaving bars with no text.
+func suiteChartHeight(suites int) int {
+	const perBar, chrome, min = 30, 90, 320
+	h := suites*perBar + chrome
+	if h < min {
+		return min
+	}
+	return h
+}
+
 // boolCell renders a flag as 1/0, matching the otherwise numeric CSV rather
 // than introducing a true/false literal.
 func boolCell(b bool) string {
@@ -486,6 +498,7 @@ type reportData struct {
 	IsEEST            bool   // the run contains zkevm fixtures
 	UnitColumn        string // header for the first Raw Data column
 	UnitAxis          string // chart x-axis title
+	SuiteChartHeight  int    // px; the suite chart's height scales with its category count
 	HasEmptyUnits     bool   // some measured unit used no gas
 	EmptyCount        int
 	GasUsed           template.JS // per-unit gas, for the client-side filter
@@ -838,6 +851,7 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		UnitAxis:          unitAxis,
 		Scaled:            scaled,
 		ScaleNote:         scaleNote,
+		SuiteChartHeight:  suiteChartHeight(len(suiteNames)),
 		HasEmptyUnits:     emptyCount > 0,
 		EmptyCount:        emptyCount,
 		GasUsed:           toJS(gasPerUnit),
@@ -892,6 +906,17 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   .chart-wrap { background: #fff; border-radius: 8px; padding: 1rem; margin-bottom: 2rem;
                 box-shadow: 0 1px 4px rgba(0,0,0,.1); max-width: 1100px; }
   canvas { max-height: 400px; }
+  /* Charts whose category count drives their height opt out of the cap. */
+  .chart-tall canvas { max-height: none; }
+  .toolbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center;
+             gap: 1rem; flex-wrap: wrap; margin: 0 0 1rem; padding: .7rem 1rem;
+             background: #fff; border: 1px solid #dee2e6; border-left: 4px solid #0d6efd;
+             border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,.08); max-width: 1100px; }
+  .toolbar label { display: inline-flex; align-items: center; gap: .45rem; cursor: pointer;
+                   font-weight: 600; font-size: .95rem; }
+  .toolbar input[type=checkbox] { width: 1.05rem; height: 1.05rem; cursor: pointer; margin: 0; }
+  .toolbar .scope { color: #6c757d; font-size: .85rem; font-weight: 400; }
+  .toolbar .hint { color: #6c757d; font-size: .8rem; flex-basis: 100%; margin: 0; }
   #execFailTable { max-width: 600px; }
   #execFailTable td:first-child { width: 10rem; }
   #errTable { max-width: 1100px; }
@@ -905,14 +930,18 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 
 <h2>Summary</h2>
 {{if .HasEmptyUnits}}
-<p class="meta" style="margin-bottom:.4rem">
-  <label style="cursor:pointer"><input type="checkbox" id="excludeEmpty" style="margin-right:.3rem">Exclude zero-gas units</label>
-  &nbsp;&nbsp;<span id="statScope">{{.Good}} units, including {{.EmptyCount}} that used no gas</span>
-</p>
-<p class="meta" style="margin-top:0;font-size:.82rem">
-  Zero-gas units ran and validated normally, but sit at the base-cost floor; with them included the
-  median reflects fixture scaffolding rather than executed work.
-</p>
+<div class="toolbar">
+  <label for="excludeEmpty">
+    <input type="checkbox" id="excludeEmpty">
+    Exclude zero-gas units ({{.EmptyCount}})
+  </label>
+  <span class="scope" id="statScope">{{.Good}} units, including {{.EmptyCount}} that used no gas</span>
+  <p class="hint">
+    Zero-gas units ran and validated normally but sit at the base-cost floor. With them included the
+    median reflects fixture scaffolding rather than executed work. Applies to the stats, charts and
+    the raw table below.
+  </p>
+</div>
 {{end}}
 <table>
   <thead><tr><th>Component</th><th>Min</th><th>P50</th><th>Max</th><th>Avg</th></tr></thead>
@@ -936,7 +965,7 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 <div class="chart-wrap"><canvas id="rankChart"></canvas></div>
 
 <h2>Median Total Cost by Suite</h2>
-<div class="chart-wrap"><canvas id="suiteChart"></canvas></div>
+<div class="chart-wrap chart-tall" style="height:{{.SuiteChartHeight}}px"><canvas id="suiteChart"></canvas></div>
 {{else}}
 {{if eq .Target "openvm"}}
 <h2>Instruction Count by Block</h2>
@@ -1098,6 +1127,20 @@ const opCosts    = {{.OpCosts}};
 const preCosts   = {{.PreCosts}};
 const memCosts   = {{.MemCosts}};
 
+// Per-unit charts are labelled by block number for corpus runs and by test name
+// for EEST runs. Test names are far too long for an axis, so abbreviate the tick
+// and keep the full name in the tooltip.
+const unitTicks = {{if .IsEEST}}{
+  autoSkip: true, maxRotation: 0, font: { size: 10 },
+  callback: function (v) {
+    const s = String(this.getLabelForValue(v));
+    const short = s.slice(s.lastIndexOf('::') + 2);
+    return short.length > 24 ? short.slice(0, 23) + '…' : short;
+  }
+}{{else}}{}{{end}};
+const unitTooltip = { callbacks: { title: items => items[0].label } };
+
+
 {{if .Scaled}}
 const rankChartObj = new Chart(document.getElementById('rankChart'), {
   type: 'line',
@@ -1123,6 +1166,21 @@ const rankChartObj = new Chart(document.getElementById('rankChart'), {
   }
 });
 
+// Suite names share a long leading path ("compute/instruction/..."); strip the
+// common prefix for the axis and keep the full name in the tooltip.
+function commonPrefix(xs) {
+  if (xs.length < 2) return '';
+  let p = xs[0];
+  for (const x of xs) {
+    while (p && !x.startsWith(p)) p = p.slice(0, -1);
+    if (!p) break;
+  }
+  const cut = p.lastIndexOf('/');
+  return cut > 0 ? p.slice(0, cut + 1) : '';
+}
+const suitePrefix = commonPrefix(suiteLabels);
+const shortSuite = s => (suitePrefix && s.startsWith(suitePrefix)) ? s.slice(suitePrefix.length) : s;
+
 const suiteChartObj = new Chart(document.getElementById('suiteChart'), {
   type: 'bar',
   data: {
@@ -1131,9 +1189,23 @@ const suiteChartObj = new Chart(document.getElementById('suiteChart'), {
   },
   options: {
     responsive: true,
+    // The wrapper's height is sized from the category count, so fill it rather
+    // than holding an aspect ratio.
+    maintainAspectRatio: false,
     indexAxis: 'y',
-    plugins: { legend: { display: false } },
-    scales: { x: { title: { display: true, text: 'Cost' }, beginAtZero: true } }
+    layout: { padding: { right: 24 } },
+    plugins: {
+      legend: { display: false },
+      tooltip: { callbacks: { title: items => items[0].label } },
+      title: suitePrefix ? { display: true, align: 'start', text: 'suite prefix: ' + suitePrefix,
+                             color: '#6c757d', font: { weight: 'normal', size: 11 } } : { display: false }
+    },
+    scales: {
+      x: { title: { display: true, text: 'Cost' }, beginAtZero: true },
+      // autoSkip is what dropped the labels; every suite must keep its tick.
+      y: { ticks: { autoSkip: false, crossAlign: 'far', font: { size: 11 },
+                    callback: function (v) { return shortSuite(this.getLabelForValue(v)); } } }
+    }
   }
 });
 {{end}}
@@ -1156,9 +1228,9 @@ new Chart(document.getElementById('instructionChart'), {
   },
   options: {
     responsive: true,
-    plugins: { legend: { display: false } },
+    plugins: { legend: { display: false }, tooltip: unitTooltip },
     scales: {
-      x: { title: { display: true, text: 'Block Number' } },
+      x: { title: { display: true, text: '{{.UnitAxis}}' }, ticks: unitTicks },
       y: { title: { display: true, text: 'Retired Instructions' }, beginAtZero: true }
     }
   }
@@ -1183,9 +1255,9 @@ const elapsedChartObj = new Chart(document.getElementById('elapsedChart'), {
   },
   options: {
     responsive: true,
-    plugins: { legend: { display: false } },
+    plugins: { legend: { display: false }, tooltip: unitTooltip },
     scales: {
-      x: { title: { display: true, text: '{{.UnitAxis}}' } },
+      x: { title: { display: true, text: '{{.UnitAxis}}' }, ticks: unitTicks },
       y: { title: { display: true, text: 'ms' }, beginAtZero: true }
     }
   }
@@ -1333,9 +1405,9 @@ const totalChartObj = new Chart(document.getElementById('totalChart'), {
   },
   options: {
     responsive: true,
-    plugins: { legend: { display: false } },
+    plugins: { legend: { display: false }, tooltip: unitTooltip },
     scales: {
-      x: { title: { display: true, text: 'Block Number' } },
+      x: { title: { display: true, text: '{{.UnitAxis}}' }, ticks: unitTicks },
       y: { title: { display: true, text: 'Cost' }, beginAtZero: true }
     }
   }
@@ -1355,9 +1427,9 @@ const stackedChartObj = new Chart(document.getElementById('stackedChart'), {
   },
   options: {
     responsive: true,
-    plugins: { legend: { position: 'top' } },
+    plugins: { legend: { position: 'top' }, tooltip: unitTooltip },
     scales: {
-      x: { stacked: true, title: { display: true, text: 'Block Number' } },
+      x: { stacked: true, title: { display: true, text: '{{.UnitAxis}}' }, ticks: unitTicks },
       y: { stacked: true, title: { display: true, text: 'Cost' }, beginAtZero: true }
     }
   }
