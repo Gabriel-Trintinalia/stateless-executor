@@ -347,9 +347,38 @@ func computeStats(vals []uint64) costStats {
 	}
 }
 
+// partitionByGas splits measured units into those that did real work and those
+// that used no gas at all.
+//
+// Zero-gas units are legitimate fixtures and are executed and validated like any
+// other, but they all sit at the base-cost floor, so mixing them into the cost
+// statistics buries the real distribution. In the EEST benchmark trees they are
+// over half of all units — the blockhash suites spend 256 empty blocks building
+// history for each block that does the work — which dragged the reported P50
+// 44x below the P50 of the units that actually computed anything.
+func partitionByGas(good []BlockResult) (worked, empty []BlockResult) {
+	for _, r := range good {
+		if r.GasUsed == 0 {
+			empty = append(empty, r)
+		} else {
+			worked = append(worked, r)
+		}
+	}
+	return worked, empty
+}
+
 func printSummary(good []BlockResult, total, validationFailures int, target string) {
 	validated := len(good) - validationFailures
 	fmt.Printf("\n=== Results (%d/%d blocks, %d/%d validated) ===\n", len(good), total, validated, len(good))
+
+	// Report costs over the units that did work. Nothing is hidden: the
+	// zero-gas population is summarised on its own below.
+	worked, empty := partitionByGas(good)
+	if len(empty) > 0 {
+		fmt.Printf("cost statistics over %d unit(s) that used gas; %d zero-gas unit(s) summarised separately\n",
+			len(worked), len(empty))
+		good = worked
+	}
 
 	if target == "openvm" {
 		insns := make([]uint64, len(good))
@@ -386,6 +415,18 @@ func printSummary(good []BlockResult, total, validationFailures int, target stri
 		s := computeStats(extract(row.fn))
 		fmt.Printf("%-14s %18d %18d %18d %18d\n", row.label, s.Min, s.P50, s.Max, s.Avg)
 	}
+
+	if len(empty) > 0 {
+		totals := make([]uint64, len(empty))
+		for i, r := range empty {
+			totals[i] = r.Costs.Total
+		}
+		s := computeStats(totals)
+		fmt.Printf("\n=== Zero-gas units (%d) — base cost only, excluded above ===\n", len(empty))
+		fmt.Printf("%-14s %18s %18s %18s %18s\n", "COMPONENT", "MIN", "P50", "MAX", "AVG")
+		fmt.Printf("%s\n", strings.Repeat("-", 92))
+		fmt.Printf("%-14s %18d %18d %18d %18d\n", "TOTAL", s.Min, s.P50, s.Max, s.Avg)
+	}
 }
 
 // ── HTML report ───────────────────────────────────────────────────────────────
@@ -402,7 +443,11 @@ type reportData struct {
 	IsEEST            bool   // the run contains zkevm fixtures
 	UnitColumn        string // header for the first Raw Data column
 	UnitAxis          string // chart x-axis title
-	Scaled            bool   // too many units for per-unit charts
+	HasEmptyUnits     bool   // some measured unit used no gas
+	EmptyCount        int
+	GasUsed           template.JS // per-unit gas, for the client-side filter
+	UnitSuiteIdx      template.JS // per-unit index into SuiteLabels
+	Scaled            bool        // too many units for per-unit charts
 	ScaleNote         string
 	RankCosts         template.JS // sorted total costs, rank on x
 	SuiteLabels       template.JS
@@ -708,6 +753,33 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		suiteNames, suiteMeds = suiteMedians(good)
 	}
 
+	// Zero-gas units are executed and validated like any other, but they all sit
+	// at the base-cost floor. In the EEST benchmark trees they are over half of
+	// all units, which drags the blended P50 far below the P50 of the units that
+	// actually computed something. Rather than pick one view, ship the per-unit
+	// gas and let the report toggle between them.
+	gasPerUnit := make([]uint64, len(good))
+	emptyCount := 0
+	for i, r := range good {
+		gasPerUnit[i] = r.GasUsed
+		if r.GasUsed == 0 {
+			emptyCount++
+		}
+	}
+	// The suite chart has to be recomputable client-side too, so emit each
+	// unit's suite as an index into a deduplicated name list.
+	if suiteNames == nil {
+		suiteNames, _ = suiteMedians(good)
+	}
+	suiteIdx := make(map[string]int, len(suiteNames))
+	for i, n := range suiteNames {
+		suiteIdx[n] = i
+	}
+	unitSuite := make([]int, len(good))
+	for i, r := range good {
+		unitSuite[i] = suiteIdx[r.Suite]
+	}
+
 	data := reportData{
 		Generated:         time.Now().Format(time.RFC1123),
 		Target:            target,
@@ -723,6 +795,10 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		UnitAxis:          unitAxis,
 		Scaled:            scaled,
 		ScaleNote:         scaleNote,
+		HasEmptyUnits:     emptyCount > 0,
+		EmptyCount:        emptyCount,
+		GasUsed:           toJS(gasPerUnit),
+		UnitSuiteIdx:      toJS(unitSuite),
 		RankCosts:         toJS(rankCosts),
 		SuiteLabels:       toJS(suiteNames),
 		SuiteMedians:      toJS(suiteMeds),
@@ -785,9 +861,19 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 <p class="meta">Generated: {{.Generated}} &nbsp;|&nbsp; Blocks: {{.Good}}/{{.Total}} succeeded{{if .ValidationFailed}} &nbsp;|&nbsp; <span style="color:#dc3545">{{.ValidationFailed}} validation failure(s)</span>{{end}}{{if .Failed}} &nbsp;|&nbsp; {{.Failed}} expected failure(s){{end}}{{if .Unverified}} &nbsp;|&nbsp; {{.Unverified}} unverified{{end}}{{if .Skipped}} &nbsp;|&nbsp; {{.Skipped}} skipped{{end}}</p>
 
 <h2>Summary</h2>
+{{if .HasEmptyUnits}}
+<p class="meta" style="margin-bottom:.4rem">
+  <label style="cursor:pointer"><input type="checkbox" id="excludeEmpty" style="margin-right:.3rem">Exclude zero-gas units</label>
+  &nbsp;&nbsp;<span id="statScope">{{.Good}} units, including {{.EmptyCount}} that used no gas</span>
+</p>
+<p class="meta" style="margin-top:0;font-size:.82rem">
+  Zero-gas units ran and validated normally, but sit at the base-cost floor; with them included the
+  median reflects fixture scaffolding rather than executed work.
+</p>
+{{end}}
 <table>
   <thead><tr><th>Component</th><th>Min</th><th>P50</th><th>Max</th><th>Avg</th></tr></thead>
-  <tbody>
+  <tbody id="statBody">
   {{range .StatRows}}
   <tr>
     <td>{{.Label}}</td>
@@ -955,6 +1041,8 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 
 <script>
 const labels             = {{.Labels}};
+const gasUsed            = {{.GasUsed}};
+const unitSuiteIdx       = {{.UnitSuiteIdx}};
 const rankCosts          = {{.RankCosts}};
 const suiteLabels        = {{.SuiteLabels}};
 const suiteMedians       = {{.SuiteMedians}};
@@ -968,7 +1056,7 @@ const preCosts   = {{.PreCosts}};
 const memCosts   = {{.MemCosts}};
 
 {{if .Scaled}}
-new Chart(document.getElementById('rankChart'), {
+const rankChartObj = new Chart(document.getElementById('rankChart'), {
   type: 'line',
   data: {
     labels: rankCosts.map((_, i) => i + 1),
@@ -992,7 +1080,7 @@ new Chart(document.getElementById('rankChart'), {
   }
 });
 
-new Chart(document.getElementById('suiteChart'), {
+const suiteChartObj = new Chart(document.getElementById('suiteChart'), {
   type: 'bar',
   data: {
     labels: suiteLabels,
@@ -1035,7 +1123,7 @@ new Chart(document.getElementById('instructionChart'), {
 {{end}}
 
 {{if not .Scaled}}
-new Chart(document.getElementById('elapsedChart'), {
+const elapsedChartObj = new Chart(document.getElementById('elapsedChart'), {
   type: 'line',
   data: {
     labels,
@@ -1080,20 +1168,112 @@ function sortTable(col) {
 }
 const rawSearch = document.getElementById('rawSearch');
 const failOnly = document.getElementById('failOnly');
+const excludeEmpty = document.getElementById('excludeEmpty');
+
+function skipEmpty() { return excludeEmpty ? excludeEmpty.checked : false; }
+
 function applyRawFilters() {
   const q = rawSearch ? rawSearch.value.trim() : '';
   const fo = failOnly ? failOnly.checked : false;
+  const se = skipEmpty();
   Array.from(document.getElementById('rawBody').rows).forEach(r => {
     const blockMatch = r.cells[0].textContent.includes(q);
     const failMatch = !fo || r.classList.contains('row-fail');
-    r.style.display = (blockMatch && failMatch) ? '' : 'none';
+    // Column 2 is GasUsed.
+    const gasMatch = !se || Number(r.cells[2].textContent.trim()) > 0;
+    r.style.display = (blockMatch && failMatch && gasMatch) ? '' : 'none';
   });
 }
 if (rawSearch) rawSearch.addEventListener('input', applyRawFilters);
 if (failOnly) failOnly.addEventListener('change', applyRawFilters);
 
+// ── zero-gas toggle ───────────────────────────────────────────────────────────
+// Mirrors computeStats in bench/main.go exactly: P50 is the element at
+// floor(n/2) of the sorted values, and Avg is integer division. Any divergence
+// here would put the report and the console summary quietly at odds.
+function statsOf(vals) {
+  if (!vals.length) return {min: 0, p50: 0, max: 0, avg: 0};
+  const s = vals.slice().sort((a, b) => a - b);
+  let sum = 0;
+  for (const v of s) sum += v;
+  return {min: s[0], p50: s[Math.floor(s.length / 2)], max: s[s.length - 1],
+          avg: Math.floor(sum / s.length)};
+}
+
+// Indices of the units currently in scope.
+function scopeIdx() {
+  const se = skipEmpty();
+  const out = [];
+  for (let i = 0; i < gasUsed.length; i++) if (!se || gasUsed[i] > 0) out.push(i);
+  return out;
+}
+const pick = (arr, idx) => idx.map(i => arr[i]);
+
+const statSeries = {{if eq .Target "openvm"}}[['INSTRUCTIONS', instructionCounts]]{{else}}[
+  ['BASE', baseCosts], ['MAIN', mainCosts], ['OPCODES', opCosts],
+  ['PRECOMPILES', preCosts], ['MEMORY', memCosts], ['TOTAL', totalCosts]
+]{{end}};
+
+function refresh() {
+  const idx = scopeIdx();
+
+  const body = document.getElementById('statBody');
+  if (body) {
+    body.innerHTML = statSeries.map(([label, series]) => {
+      const s = statsOf(pick(series, idx));
+      return '<tr><td>' + label + '</td><td>' + s.min + '</td><td>' + s.p50 +
+             '</td><td>' + s.max + '</td><td>' + s.avg + '</td></tr>';
+    }).join('');
+  }
+
+  const scope = document.getElementById('statScope');
+  if (scope) {
+    scope.textContent = skipEmpty()
+      ? idx.length + ' units that used gas (' + (gasUsed.length - idx.length) + ' zero-gas excluded)'
+      : gasUsed.length + ' units, including ' + (gasUsed.length - idx.length ||
+          gasUsed.filter(g => g === 0).length) + ' that used no gas';
+  }
+
+  if (typeof rankChartObj !== 'undefined') {
+    const sorted = pick(totalCosts, idx).sort((a, b) => a - b);
+    rankChartObj.data.labels = sorted.map((_, i) => i + 1);
+    rankChartObj.data.datasets[0].data = sorted;
+    rankChartObj.update();
+  }
+
+  if (typeof suiteChartObj !== 'undefined') {
+    const bySuite = new Map();
+    for (const i of idx) {
+      const k = unitSuiteIdx[i];
+      if (!bySuite.has(k)) bySuite.set(k, []);
+      bySuite.get(k).push(totalCosts[i]);
+    }
+    const keys = Array.from(bySuite.keys()).sort((a, b) => a - b);
+    suiteChartObj.data.labels = keys.map(k => suiteLabels[k]);
+    suiteChartObj.data.datasets[0].data = keys.map(k => statsOf(bySuite.get(k)).p50);
+    suiteChartObj.update();
+  }
+
+  for (const [obj, series] of [[typeof totalChartObj !== 'undefined' ? totalChartObj : null, totalCosts],
+                               [typeof elapsedChartObj !== 'undefined' ? elapsedChartObj : null, elapsedMs]]) {
+    if (!obj) continue;
+    obj.data.labels = pick(labels, idx);
+    obj.data.datasets[0].data = pick(series, idx);
+    obj.update();
+  }
+  if (typeof stackedChartObj !== 'undefined') {
+    stackedChartObj.data.labels = pick(labels, idx);
+    const series = [baseCosts, mainCosts, opCosts, preCosts, memCosts];
+    stackedChartObj.data.datasets.forEach((d, i) => { d.data = pick(series[i], idx); });
+    stackedChartObj.update();
+  }
+
+  applyRawFilters();
+}
+if (excludeEmpty) excludeEmpty.addEventListener('change', refresh);
+
 {{if and (not .Scaled) (eq .Target "zisk")}}
-new Chart(document.getElementById('totalChart'), {
+const totalChartObj = new Chart(document.getElementById('totalChart'), {
   type: 'line',
   data: {
     labels,
@@ -1118,7 +1298,7 @@ new Chart(document.getElementById('totalChart'), {
   }
 });
 
-new Chart(document.getElementById('stackedChart'), {
+const stackedChartObj = new Chart(document.getElementById('stackedChart'), {
   type: 'bar',
   data: {
     labels,

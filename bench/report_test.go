@@ -194,8 +194,10 @@ func TestWriteReportScaleGating(t *testing.T) {
 				t.Fatal(err)
 			}
 			html := string(b)
-			hasRank := strings.Contains(html, "rankChart")
-			hasStacked := strings.Contains(html, "stackedChart")
+			// Assert on chart construction, not on the identifier: the
+			// zero-gas toggle's refresh helper mentions every chart by name.
+			hasRank := strings.Contains(html, `getElementById('rankChart')`)
+			hasStacked := strings.Contains(html, `getElementById('stackedChart')`)
 			if hasRank != tc.wantScaled {
 				t.Errorf("rankChart present = %v, want %v", hasRank, tc.wantScaled)
 			}
@@ -233,4 +235,65 @@ func TestWriteReportSkipAndUnverifiedTables(t *testing.T) {
 	if strings.Contains(html, `<table id="errTable">`) {
 		t.Error("skips and unverified units must not render as errors")
 	}
+}
+
+// The zero-gas toggle only appears when the run actually contains such units,
+// so corpus reports are unaffected.
+func TestWriteReportZeroGasToggleOnlyWhenRelevant(t *testing.T) {
+	mk := func(gas ...uint64) []BlockResult {
+		rs := make([]BlockResult, len(gas))
+		for i, g := range gas {
+			rs[i] = BlockResult{
+				Kind: fixture.FormatZkevm, Suite: "s", Label: "t", GasUsed: g,
+				Costs: CostReport{Total: 100 + uint64(i)}, ValidationOK: true,
+				Verdict: verdict{Kind: verdictPass},
+			}
+		}
+		return rs
+	}
+
+	t.Run("no zero-gas units", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "r.html")
+		rs := mk(1000, 2000)
+		if err := writeReport(p, rs, rs, "zisk"); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := os.ReadFile(p)
+		// The JS lookup is emitted unconditionally and is inert without the
+		// checkbox, so assert on the input element itself.
+		if strings.Contains(string(b), `id="excludeEmpty"`) {
+			t.Error("the toggle must not render when every unit used gas")
+		}
+	})
+
+	t.Run("some zero-gas units", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "r.html")
+		rs := mk(0, 0, 5000)
+		if err := writeReport(p, rs, rs, "zisk"); err != nil {
+			t.Fatal(err)
+		}
+		html := string(mustRead(t, p))
+		for _, want := range []string{`id="excludeEmpty"`, "Exclude zero-gas units", "const gasUsed", "statBody"} {
+			if !strings.Contains(html, want) {
+				t.Errorf("report is missing %q", want)
+			}
+		}
+		// The per-unit gas array drives the filter, so it must be complete and
+		// in row order.
+		if !strings.Contains(html, "const gasUsed            = [0,0,5000];") {
+			t.Error("per-unit gas array missing or out of order")
+		}
+		if !strings.Contains(html, "including 2 that used no gas") {
+			t.Error("the zero-gas count must be stated up front")
+		}
+	})
+}
+
+func mustRead(t *testing.T, p string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
