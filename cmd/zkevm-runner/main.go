@@ -7,14 +7,12 @@
 package main
 
 import (
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"html/template"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -22,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Gabriel-Trintinalia/stateless-executor/emu"
 	"github.com/Gabriel-Trintinalia/stateless-executor/fixture"
 )
 
@@ -227,49 +226,27 @@ func dumpOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, idx int, dir 
 }
 
 // runOne encodes and executes one zkevm block. Returns (gotSuccess, outputHex, rawOutput, error).
+//
+// The emulator invocation itself lives in package emu, shared with the bench
+// tool, so there is one place that builds the command line and one place that
+// detects a step-capped run.
 func runOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, elfPath, ziskemuPath string) (bool, string, string, error) {
 	input, _, err := fixture.ZesuInputFromZkevmBlock(tc, block)
 	if err != nil {
 		return false, "", "", fmt.Errorf("encode: %w", err)
 	}
 
-	in, err := os.CreateTemp("", "zkevm-runner-in-*.bin")
-	if err != nil {
-		return false, "", "", err
-	}
-	defer os.Remove(in.Name())
-	if _, err := in.Write(input); err != nil {
-		in.Close()
-		return false, "", "", err
-	}
-	if err := in.Close(); err != nil {
-		return false, "", "", err
-	}
-
-	out, err := os.CreateTemp("", "zkevm-runner-out-*.bin")
-	if err != nil {
-		return false, "", "", err
-	}
-	defer os.Remove(out.Name())
-	out.Close()
-
-	cmd, err := exec.Command(ziskemuPath, "-X", "-e", elfPath, "-i", in.Name(), "-o", out.Name()).
-		CombinedOutput()
-	rawOut := strings.TrimSpace(string(cmd))
-	if err != nil {
-		return false, "", rawOut, fmt.Errorf("zkvm: %w", err)
+	// RequireCosts stays false: this tool needs the guest's verdict, not the
+	// cost table, so a run that printed no COST DISTRIBUTION is not an error.
+	r, runErr := emu.Run(emu.Opts{ELF: elfPath, Bin: ziskemuPath}, input)
+	if runErr != nil {
+		return false, r.OutputHex, r.RawOut, runErr
 	}
 
 	// success=1 in the zesu UART log means EVM execution succeeded.
 	// success=0 means the block was invalid (ziskemu still exits 0).
-	gotSuccess := strings.Contains(rawOut, "success=1") && !strings.Contains(rawOut, "success=0")
-
-	// Read the 41-byte SszStatelessValidationResult that the guest wrote to the output region.
-	outputBytes, err := os.ReadFile(out.Name())
-	if err != nil {
-		return gotSuccess, "", rawOut, nil
-	}
-	return gotSuccess, hex.EncodeToString(outputBytes), rawOut, nil
+	gotSuccess := strings.Contains(r.RawOut, "success=1") && !strings.Contains(r.RawOut, "success=0")
+	return gotSuccess, r.OutputHex, r.RawOut, nil
 }
 
 // filterUARTLog keeps only the key info lines from ziskemu UART output.

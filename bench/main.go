@@ -4,48 +4,38 @@
 //
 // Usage:
 //
-//	bench --fixtures <dir> --elf <path> [--target zisk|openvm] [--ziskemu <path>] [--runner <path>] [--jobs N] [--report <path>]
+//	bench --fixtures <dir|file> --elf <path> [--target zisk|openvm] [--zkvmPath <path>]
+//	      [--jobs N] [--report <path>] [--csv <path>] [--dry-run]
 package main
 
 import (
-	"bufio"
 	"encoding/binary"
+	"encoding/csv"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
 	"log"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Gabriel-Trintinalia/stateless-executor/fixture"
 )
 
-// CostReport holds the parsed COST DISTRIBUTION table for one block.
-// ZisK populates Base/Main/Opcodes/Precompiles/Memory/Total (circuit trace cells).
-// OpenVM populates Instructions/Total (retired instruction count).
-type CostReport struct {
-	Base         uint64
-	Main         uint64
-	Opcodes      uint64
-	Precompiles  uint64
-	Memory       uint64
-	Total        uint64
-	Instructions uint64 // OpenVM: retired instruction count (deterministic)
-}
-
 // BlockResult holds the outcome of running one fixture block.
 type BlockResult struct {
 	BlockNum        uint64
 	Name            string
+	Label           string // unit label: corpus file stem, or EEST test-case name[/blockN]
+	Suite           string // fixture dir relative to the fixtures root
+	Network         string // EEST only; "" for corpus
+	Kind            fixture.Format
+	Verdict         verdict
 	Target          string // "zisk" or "openvm"
 	Costs           CostReport
 	Err             error
@@ -55,14 +45,14 @@ type BlockResult struct {
 	ExpectedSuccess bool
 	ValidationOK    bool
 	// Block characteristics for correlation analysis.
-	TxCount     int
-	GasUsed     uint64
-	LegacyTxs   int
-	Eip1559Txs  int
-	Eip2930Txs  int
-	Eip4844Txs  int
-	Eip7702Txs  int
-	OutputHex string
+	TxCount    int
+	GasUsed    uint64
+	LegacyTxs  int
+	Eip1559Txs int
+	Eip2930Txs int
+	Eip4844Txs int
+	Eip7702Txs int
+	OutputHex  string
 }
 
 var blockNumRe = regexp.MustCompile(`block_(\d+)`)
@@ -74,15 +64,25 @@ func main() {
 	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM)")
 	jobs := flag.Int("jobs", 1, "number of parallel emulator runs")
 	reportPath := flag.String("report", "bench_report.html", "output HTML report path")
-	csvPath := flag.String("csv", "", "optional path to write per-block CSV (block_num,tx_count,gas_used,legacy,eip1559,eip2930,eip4844,eip7702,base,main,opcodes,precompiles,memory,total,elapsed_ms)")
+	csvPath := flag.String("csv", "", "optional path to write a per-unit CSV; see csvHeader for the columns")
+	dryRun := flag.Bool("dry-run", false, "discover fixtures, print the per-format census, and exit without running the emulator")
+	maxSteps := flag.Uint64("maxSteps", 0, "emulator step cap, passed as -n; 0 leaves the emulator on its default (68719476735)")
 	flag.Parse()
 
-	if *fixturesDir == "" || *elfPath == "" {
+	if *fixturesDir == "" {
+		flag.Usage()
+		os.Exit(1)
+	}
+	// --dry-run touches no emulator, so it does not need an ELF.
+	if *elfPath == "" && !*dryRun {
 		flag.Usage()
 		os.Exit(1)
 	}
 	if *targetFlag != "zisk" && *targetFlag != "openvm" {
 		log.Fatalf("unknown target %q: must be zisk or openvm", *targetFlag)
+	}
+	if *jobs < 1 {
+		log.Fatalf("--jobs must be at least 1, got %d", *jobs)
 	}
 	if *zkvmPath == "" {
 		if *targetFlag == "openvm" {
@@ -91,117 +91,99 @@ func main() {
 			*zkvmPath = "ziskemu"
 		}
 	}
-	if _, err := os.Stat(*elfPath); err != nil {
-		log.Fatalf("ELF not found at %s: %v", *elfPath, err)
+	if !*dryRun {
+		if _, err := os.Stat(*elfPath); err != nil {
+			log.Fatalf("ELF not found at %s: %v", *elfPath, err)
+		}
 	}
 
-	paths, err := collectJSON(*fixturesDir)
+	jobsFound, skipped, err := discover(*fixturesDir)
 	if err != nil {
 		log.Fatalf("collect fixtures: %v", err)
 	}
-	if len(paths) == 0 {
-		log.Fatalf("no JSON fixtures found in %s", *fixturesDir)
+	if *dryRun {
+		printCensus(census{Jobs: jobsFound, Skipped: skipped})
+		return
 	}
-	log.Printf("found %d fixtures, running with %s/%s (%d job(s))...", len(paths), *targetFlag, *zkvmPath, *jobs)
+	for _, s := range skipped {
+		log.Printf("SKIP %s: %s", s.Path, s.Reason)
+	}
+	if len(jobsFound) == 0 {
+		log.Fatalf("no runnable JSON fixtures found in %s (%d skipped)", *fixturesDir, len(skipped))
+	}
 
-	var runBench func(fixturePath string) (CostReport, string, string, error, bool, blockInfo)
+	// OpenVM's verdict comes from a fixed-offset read of the output region and
+	// has no EEST equivalent, so refuse the combination up front rather than
+	// mis-reporting thousands of units. The formats are known from discovery.
 	if *targetFlag == "openvm" {
-		ep, zp := *elfPath, *zkvmPath
-		runBench = func(p string) (CostReport, string, string, error, bool, blockInfo) {
-			costs, execErr, out, err, ok := benchOneOpenVM(p, ep, zp)
-			return costs, execErr, out, err, ok, blockInfo{}
+		for _, j := range jobsFound {
+			if j.Kind != fixture.FormatCorpus {
+				log.Fatalf("%s: --target openvm does not support %s fixtures", j.Path, j.Kind)
+			}
 		}
+	}
+	// A mixed run is well-defined but its summary statistics span two
+	// incomparable populations, so warn rather than refuse.
+	if hasKind(jobsFound, fixture.FormatCorpus) && hasKind(jobsFound, fixture.FormatZkevm) {
+		log.Printf("WARNING: mixed corpus and zkevm fixtures — summary statistics span both and are not meaningful")
+	}
+
+	log.Printf("found %d fixtures, running with %s/%s (%d job(s))...", len(jobsFound), *targetFlag, *zkvmPath, *jobs)
+
+	o := emuOpts{ELF: *elfPath, Bin: *zkvmPath, MaxSteps: *maxSteps}
+	var run emuRunner
+	if *targetFlag == "openvm" {
+		run = func(input []byte) (emuResult, error) { return runOpenVM(o, input) }
 	} else {
-		ep, zp := *elfPath, *zkvmPath
-		runBench = func(p string) (CostReport, string, string, error, bool, blockInfo) {
-			return benchOne(p, ep, zp)
-		}
+		run = func(input []byte) (emuResult, error) { return runEmu(o, input) }
 	}
 
-	results := make([]BlockResult, len(paths))
-	sem := make(chan struct{}, *jobs)
-	var wg sync.WaitGroup
-	var done atomic.Int64
-
-	for i, p := range paths {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(idx int, path string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			name := strings.TrimSuffix(filepath.Base(path), ".json")
-			blockNum := extractBlockNum(name)
-			t := time.Now()
-			costs, execErr, errOut, runErr, expectedSuccess, bi := runBench(path)
-			elapsed := time.Since(t)
-			gotSuccess := runErr == nil && execErr == ""
-			validationOK := runErr == nil && gotSuccess == expectedSuccess
-			n := done.Add(1)
-			if runErr != nil {
-				fmt.Printf("[%3d/%d] ERROR %-40s  %v\n", n, len(paths), name, runErr)
-			} else if !validationOK {
-				if *targetFlag == "openvm" {
-					fmt.Printf("[%3d/%d] block %d  VALIDATION FAILED (expected success=%v)  (%s)\n", n, len(paths), blockNum, expectedSuccess, elapsed.Round(time.Millisecond))
-				} else {
-					fmt.Printf("[%3d/%d] block %d  total=%d  VALIDATION FAILED (expected success=%v)  (%s)\n", n, len(paths), blockNum, costs.Total, expectedSuccess, elapsed.Round(time.Millisecond))
-				}
-			} else if execErr != "" {
-				if *targetFlag == "openvm" {
-					fmt.Printf("[%3d/%d] block %d  EXEC FAILED (expected): %s  (%s)\n", n, len(paths), blockNum, execErr, elapsed.Round(time.Millisecond))
-				} else {
-					fmt.Printf("[%3d/%d] block %d  total=%d  EXEC FAILED (expected): %s  (%s)\n", n, len(paths), blockNum, costs.Total, execErr, elapsed.Round(time.Millisecond))
-				}
-			} else {
-				if *targetFlag == "openvm" {
-					fmt.Printf("[%3d/%d] block %d  (%s)\n", n, len(paths), blockNum, elapsed.Round(time.Millisecond))
-				} else {
-					fmt.Printf("[%3d/%d] block %d  total=%d  (%s)\n", n, len(paths), blockNum, costs.Total, elapsed.Round(time.Millisecond))
-				}
-			}
-			results[idx] = BlockResult{
-				BlockNum:        blockNum,
-				Name:            name,
-				Target:          *targetFlag,
-				Costs:           costs,
-				Err:             runErr,
-				ErrOutput:       errOut,
-				ExecError:       execErr,
-				Elapsed:         elapsed,
-				ExpectedSuccess: expectedSuccess,
-				ValidationOK:    validationOK,
-				TxCount:         bi.TxCount,
-				GasUsed:         bi.GasUsed,
-				LegacyTxs:       bi.LegacyTxs,
-				Eip1559Txs:      bi.Eip1559Txs,
-				Eip2930Txs:      bi.Eip2930Txs,
-				Eip4844Txs:      bi.Eip4844Txs,
-				Eip7702Txs:      bi.Eip7702Txs,
-				OutputHex:       bi.OutputHex,
-			}
-		}(i, p)
+	results := runAll(jobsFound, run, *targetFlag, *jobs)
+	if len(results) == 0 {
+		log.Fatalf("no runnable units across %d file(s)", len(jobsFound))
 	}
-	wg.Wait()
 
+	// good is the population the cost statistics and the charts are computed
+	// over: units that actually ran and produced a cost table. Skipped units
+	// never ran, so including them would report a real workload of zero cost and
+	// count each one as a validation failure. Errored units are excluded for the
+	// same reason — their cost tables are truncated or absent.
 	var good []BlockResult
 	var validationFailures []BlockResult
+	var skippedUnits, unverified int
 	for _, r := range results {
-		if r.Err == nil {
+		switch r.Verdict.Kind {
+		case verdictSkip:
+			skippedUnits++
+		case verdictError:
+			// Already surfaced through r.Err and the Errors table.
+		case verdictFail:
 			good = append(good, r)
-			if !r.ValidationOK {
-				validationFailures = append(validationFailures, r)
-			}
+			validationFailures = append(validationFailures, r)
+		case verdictUnverified:
+			// Measured but not validated: its costs are real, so it belongs in
+			// the statistics, but it is not a failure.
+			unverified++
+			good = append(good, r)
+		default:
+			good = append(good, r)
 		}
 	}
-	sort.Slice(good, func(i, j int) bool { return good[i].BlockNum < good[j].BlockNum })
+	sortResults(good)
 
 	if len(good) > 0 {
 		printSummary(good, len(results), len(validationFailures), *targetFlag)
 	} else {
-		log.Printf("WARNING: no successful results — report will contain errors only")
+		log.Printf("WARNING: no units produced costs — report will contain errors and skips only")
 	}
 	if len(validationFailures) > 0 {
-		log.Printf("VALIDATION FAILURES: %d block(s) had unexpected execution outcome", len(validationFailures))
+		log.Printf("VALIDATION FAILURES: %d unit(s) had unexpected execution outcome", len(validationFailures))
+	}
+	if unverified > 0 {
+		log.Printf("UNVERIFIED: %d unit(s) ran but carry no expected output to compare against", unverified)
+	}
+	if skippedUnits > 0 {
+		log.Printf("SKIPPED: %d unit(s) had no stateless input to run", skippedUnits)
 	}
 
 	if err := writeReport(*reportPath, good, results, *targetFlag); err != nil {
@@ -229,88 +211,136 @@ type blockInfo struct {
 	OutputHex  string
 }
 
+// suiteChartHeight sizes the per-suite bar chart so every category keeps a
+// readable tick label. With a fixed 400px canvas, 27 suites left ~15px each and
+// Chart.js silently dropped most labels via autoSkip, leaving bars with no text.
+func suiteChartHeight(suites int) int {
+	const perBar, chrome, min = 30, 90, 320
+	h := suites*perBar + chrome
+	if h < min {
+		return min
+	}
+	return h
+}
+
+// boolCell renders a flag as 1/0, matching the otherwise numeric CSV rather
+// than introducing a true/false literal.
+func boolCell(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+// sortResults orders rows for the CSV and the report.
+//
+// Corpus rows sort by block number — not by label, which sorts wrong across the
+// 8-to-9-digit boundary. EEST block numbers are all 1 or 2 within a fixture and
+// so cannot order anything; those sort by (suite, label, block number).
+//
+// The sort is stable in both cases. With an unstable sort, EEST rows would come
+// out in a different order on every run, destroying the A/B diffing the tool
+// exists for.
+func sortResults(rs []BlockResult) {
+	sort.SliceStable(rs, func(i, j int) bool {
+		a, b := rs[i], rs[j]
+		if a.Kind == fixture.FormatZkevm || b.Kind == fixture.FormatZkevm {
+			if a.Suite != b.Suite {
+				return a.Suite < b.Suite
+			}
+			if a.Label != b.Label {
+				return a.Label < b.Label
+			}
+		}
+		return a.BlockNum < b.BlockNum
+	})
+}
+
+// statelessOutput is the guest's decoded verdict region.
+//
+// zkevm@v0.8.0: SszStatelessValidationResult is a flat 43 bytes —
+// root(32) ‖ valid(1) ‖ chain_id(8, LE) ‖ schema_id(2, LE).
+type statelessOutput struct {
+	PayloadRoot string // hex of out[0:32]: new_payload_request_root
+	Success     bool   // out[32]: 0x01 = valid
+	ChainID     uint64 // out[33:41]
+	SchemaID    uint16 // out[41:43]
+	OK          bool   // the region was present and long enough to decode
+}
+
+// decodeStatelessOutput parses the hex output region. A short or unparsable
+// region yields OK false and a zero value, never a partial decode.
+func decodeStatelessOutput(outputHex string) statelessOutput {
+	b, err := hex.DecodeString(outputHex)
+	if err != nil || len(b) < statelessOutputSize {
+		return statelessOutput{}
+	}
+	return statelessOutput{
+		PayloadRoot: hex.EncodeToString(b[0:32]),
+		Success:     b[32] == 0x01,
+		ChainID:     binary.LittleEndian.Uint64(b[33:41]),
+		SchemaID:    binary.LittleEndian.Uint16(b[41:43]),
+		OK:          true,
+	}
+}
+
+// csvHeader is the column order. New columns are appended rather than
+// interleaved, so the first fifteen fields are unchanged and positional
+// accessors into the archived runs ($14 total, $15 elapsed_ms) keep working.
+var csvHeader = []string{
+	"block_num", "tx_count", "gas_used",
+	"legacy", "eip1559", "eip2930", "eip4844", "eip7702",
+	"base", "main", "opcodes", "precompiles", "memory", "total", "elapsed_ms",
+	"steps", "suite", "label", "payload_root", "success",
+}
+
+// writeCSV uses encoding/csv because EEST labels contain commas, brackets and
+// colons and have to be quoted. Numeric fields are never quoted, so corpus rows
+// come out byte-identical to the hand-rolled Fprintf this replaces.
 func writeCSV(path string, results []BlockResult) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	fmt.Fprintln(f, "block_num,tx_count,gas_used,legacy,eip1559,eip2930,eip4844,eip7702,base,main,opcodes,precompiles,memory,total,elapsed_ms")
+
+	w := csv.NewWriter(f)
+	if err := w.Write(csvHeader); err != nil {
+		return err
+	}
+	u := func(v uint64) string { return strconv.FormatUint(v, 10) }
 	for _, r := range results {
-		fmt.Fprintf(f, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
-			r.BlockNum,
-			r.TxCount,
-			r.GasUsed,
-			r.LegacyTxs,
-			r.Eip1559Txs,
-			r.Eip2930Txs,
-			r.Eip4844Txs,
-			r.Eip7702Txs,
-			r.Costs.Base,
-			r.Costs.Main,
-			r.Costs.Opcodes,
-			r.Costs.Precompiles,
-			r.Costs.Memory,
-			r.Costs.Total,
-			r.Elapsed.Milliseconds(),
-		)
+		out := decodeStatelessOutput(r.OutputHex)
+		if err := w.Write([]string{
+			u(r.BlockNum),
+			strconv.Itoa(r.TxCount),
+			u(r.GasUsed),
+			strconv.Itoa(r.LegacyTxs),
+			strconv.Itoa(r.Eip1559Txs),
+			strconv.Itoa(r.Eip2930Txs),
+			strconv.Itoa(r.Eip4844Txs),
+			strconv.Itoa(r.Eip7702Txs),
+			u(r.Costs.Base),
+			u(r.Costs.Main),
+			u(r.Costs.Opcodes),
+			u(r.Costs.Precompiles),
+			u(r.Costs.Memory),
+			u(r.Costs.Total),
+			strconv.FormatInt(r.Elapsed.Milliseconds(), 10),
+			u(r.Costs.Steps),
+			r.Suite,
+			r.Label,
+			// The guest's verdict, so a run's CSV alone reproduces its report.
+			// These are the only two output fields the report renders; chain_id
+			// and schema_id are decoded but never displayed.
+			out.PayloadRoot,
+			boolCell(out.Success),
+		}); err != nil {
+			return err
+		}
 	}
-	return nil
-}
-
-// benchOne returns (costs, execError, rawOutput, error, expectedSuccess, blockInfo) for a ZisK run.
-func benchOne(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool, blockInfo) {
-	f, err := fixture.LoadFile(fixturePath)
-	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false, blockInfo{}
-	}
-
-	bi := extractBlockInfo(f)
-
-	input, err := fixture.ZesuInputSSZ(f)
-	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success, bi
-	}
-
-	tmp, err := os.CreateTemp("", "zesu-bench-*.bin")
-	if err != nil {
-		return CostReport{}, "", "", err, f.Success, bi
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(input); err != nil {
-		tmp.Close()
-		return CostReport{}, "", "", err, f.Success, bi
-	}
-	if err := tmp.Close(); err != nil {
-		return CostReport{}, "", "", err, f.Success, bi
-	}
-
-	outFile, err := os.CreateTemp("", "zesu-bench-out-*.bin")
-	if err != nil {
-		return CostReport{}, "", "", err, f.Success, bi
-	}
-	outPath := outFile.Name()
-	outFile.Close()
-	defer os.Remove(outPath)
-
-	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmp.Name(), "-o", outPath).
-		CombinedOutput()
-	rawOut := strings.TrimSpace(string(out))
-	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("zkvm: %w", err), f.Success, bi
-	}
-
-	costs, ok := parseCostReport(rawOut)
-	if !ok {
-		return CostReport{}, "", rawOut, fmt.Errorf("no COST DISTRIBUTION in ziskemu output"), f.Success, bi
-	}
-	execErr := parseExecError(rawOut)
-
-	if outBytes, err2 := os.ReadFile(outPath); err2 == nil {
-		bi.OutputHex = hex.EncodeToString(outBytes)
-	}
-
-	return costs, execErr, rawOut, nil, f.Success, bi
+	w.Flush()
+	return w.Error()
 }
 
 func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
@@ -318,14 +348,19 @@ func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
 	txs := f.StatelessInput.Block.Body.Transactions
 	bi.TxCount = len(txs)
 	for _, tx := range txs {
+		// The keys are capitalised, matching buildTx in fixture/encode.go, which
+		// errors on any other spelling — so a fixture that encodes at all uses
+		// these. They were previously lowercase and therefore always missed,
+		// which is why every transaction was counted as legacy and four of the
+		// CSV columns were always zero.
 		switch {
-		case tx.Transaction["eip1559"] != nil:
+		case tx.Transaction["Eip1559"] != nil:
 			bi.Eip1559Txs++
-		case tx.Transaction["eip4844"] != nil:
+		case tx.Transaction["Eip4844"] != nil:
 			bi.Eip4844Txs++
-		case tx.Transaction["eip2930"] != nil:
+		case tx.Transaction["Eip2930"] != nil:
 			bi.Eip2930Txs++
-		case tx.Transaction["eip7702"] != nil:
+		case tx.Transaction["Eip7702"] != nil:
 			bi.Eip7702Txs++
 		default:
 			bi.LegacyTxs++
@@ -333,121 +368,6 @@ func extractBlockInfo(f *fixture.FixtureFile) blockInfo {
 	}
 	bi.GasUsed = f.StatelessInput.Block.Header.GasUsed
 	return bi
-}
-
-// benchOneOpenVM returns (costs, execError, rawOutput, error, expectedSuccess) for an OpenVM run.
-// costs is always zero — OpenVM emulation does not produce a circuit cost breakdown.
-// execError is "ExecutionFailed" when the guest writes success=0 to public values byte[32].
-func benchOneOpenVM(fixturePath, elfPath, zkvmPath string) (CostReport, string, string, error, bool) {
-	f, err := fixture.LoadFile(fixturePath)
-	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("load: %w", err), false
-	}
-
-	input, err := fixture.ZesuInputSSZ(f)
-	if err != nil {
-		return CostReport{}, "", "", fmt.Errorf("encode: %w", err), f.Success
-	}
-
-	tmpIn, err := os.CreateTemp("", "zesu-bench-in-*.bin")
-	if err != nil {
-		return CostReport{}, "", "", err, f.Success
-	}
-	defer os.Remove(tmpIn.Name())
-	if _, err := tmpIn.Write(input); err != nil {
-		tmpIn.Close()
-		return CostReport{}, "", "", err, f.Success
-	}
-	if err := tmpIn.Close(); err != nil {
-		return CostReport{}, "", "", err, f.Success
-	}
-
-	tmpOut, err := os.CreateTemp("", "zesu-bench-out-*.bin")
-	if err != nil {
-		return CostReport{}, "", "", err, f.Success
-	}
-	tmpOutPath := tmpOut.Name()
-	tmpOut.Close()
-	defer os.Remove(tmpOutPath)
-
-	out, err := exec.Command(zkvmPath, "-X", "-e", elfPath, "-i", tmpIn.Name(), "-o", tmpOutPath).
-		CombinedOutput()
-	rawOut := strings.TrimSpace(string(out))
-	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("runner: %w", err), f.Success
-	}
-
-	outBytes, err := os.ReadFile(tmpOutPath)
-	if err != nil {
-		return CostReport{}, "", rawOut, fmt.Errorf("read output: %w", err), f.Success
-	}
-	if len(outBytes) < 41 {
-		return CostReport{}, "", rawOut, fmt.Errorf("output too short: %d bytes (expected 41)", len(outBytes)), f.Success
-	}
-
-	execErr := ""
-	if outBytes[32] == 0 {
-		execErr = "ExecutionFailed"
-	}
-	costs, _ := parseCostReport(rawOut)
-	return costs, execErr, rawOut, nil, f.Success
-}
-
-var execFailedRe = regexp.MustCompile(`error: execution failed: (\S+)`)
-
-func parseExecError(output string) string {
-	m := execFailedRe.FindStringSubmatch(output)
-	if len(m) < 2 {
-		return ""
-	}
-	return m[1]
-}
-
-// parseCostReport parses a COST DISTRIBUTION table from combined runner output.
-// Handles both ZisK (BASE/MAIN/OPCODES/PRECOMPILES/MEMORY/TOTAL) and
-// OpenVM (ELAPSED_MS/TOTAL) table formats.
-func parseCostReport(output string) (CostReport, bool) {
-	var r CostReport
-	sc := bufio.NewScanner(strings.NewReader(output))
-	found := false
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if v, ok := parseCostLine(line, "BASE"); ok {
-			r.Base = v
-			found = true
-		} else if v, ok := parseCostLine(line, "MAIN"); ok {
-			r.Main = v
-		} else if v, ok := parseCostLine(line, "OPCODES"); ok {
-			r.Opcodes = v
-		} else if v, ok := parseCostLine(line, "PRECOMPILES"); ok {
-			r.Precompiles = v
-		} else if v, ok := parseCostLine(line, "MEMORY"); ok {
-			r.Memory = v
-		} else if v, ok := parseCostLine(line, "INSTRUCTIONS"); ok {
-			r.Instructions = v
-			found = true
-		} else if v, ok := parseCostLine(line, "TOTAL"); ok {
-			r.Total = v
-		}
-	}
-	return r, found
-}
-
-func parseCostLine(line, label string) (uint64, bool) {
-	rest, ok := strings.CutPrefix(line, label)
-	if !ok {
-		return 0, false
-	}
-	fields := strings.Fields(rest)
-	if len(fields) == 0 {
-		return 0, false
-	}
-	clean := strings.ReplaceAll(fields[0], ",", "")
-	n, err := strconv.ParseUint(clean, 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
 }
 
 func extractBlockNum(name string) uint64 {
@@ -482,9 +402,38 @@ func computeStats(vals []uint64) costStats {
 	}
 }
 
+// partitionByGas splits measured units into those that did real work and those
+// that used no gas at all.
+//
+// Zero-gas units are legitimate fixtures and are executed and validated like any
+// other, but they all sit at the base-cost floor, so mixing them into the cost
+// statistics buries the real distribution. In the EEST benchmark trees they are
+// over half of all units — the blockhash suites spend 256 empty blocks building
+// history for each block that does the work — which dragged the reported P50
+// 44x below the P50 of the units that actually computed anything.
+func partitionByGas(good []BlockResult) (worked, empty []BlockResult) {
+	for _, r := range good {
+		if r.GasUsed == 0 {
+			empty = append(empty, r)
+		} else {
+			worked = append(worked, r)
+		}
+	}
+	return worked, empty
+}
+
 func printSummary(good []BlockResult, total, validationFailures int, target string) {
 	validated := len(good) - validationFailures
 	fmt.Printf("\n=== Results (%d/%d blocks, %d/%d validated) ===\n", len(good), total, validated, len(good))
+
+	// Report costs over the units that did work. Nothing is hidden: the
+	// zero-gas population is summarised on its own below.
+	worked, empty := partitionByGas(good)
+	if len(empty) > 0 {
+		fmt.Printf("cost statistics over %d unit(s) that used gas; %d zero-gas unit(s) summarised separately\n",
+			len(worked), len(empty))
+		good = worked
+	}
 
 	if target == "openvm" {
 		insns := make([]uint64, len(good))
@@ -521,6 +470,18 @@ func printSummary(good []BlockResult, total, validationFailures int, target stri
 		s := computeStats(extract(row.fn))
 		fmt.Printf("%-14s %18d %18d %18d %18d\n", row.label, s.Min, s.P50, s.Max, s.Avg)
 	}
+
+	if len(empty) > 0 {
+		totals := make([]uint64, len(empty))
+		for i, r := range empty {
+			totals[i] = r.Costs.Total
+		}
+		s := computeStats(totals)
+		fmt.Printf("\n=== Zero-gas units (%d) — base cost only, excluded above ===\n", len(empty))
+		fmt.Printf("%-14s %18s %18s %18s %18s\n", "COMPONENT", "MIN", "P50", "MAX", "AVG")
+		fmt.Printf("%s\n", strings.Repeat("-", 92))
+		fmt.Printf("%-14s %18d %18d %18d %18d\n", "TOTAL", s.Min, s.P50, s.Max, s.Avg)
+	}
 }
 
 // ── HTML report ───────────────────────────────────────────────────────────────
@@ -532,6 +493,21 @@ type reportData struct {
 	Good              int
 	Failed            int
 	ValidationFailed  int
+	Skipped           int
+	Unverified        int
+	IsEEST            bool   // the run contains zkevm fixtures
+	UnitColumn        string // header for the first Raw Data column
+	UnitAxis          string // chart x-axis title
+	SuiteChartHeight  int    // px; the suite chart's height scales with its category count
+	HasEmptyUnits     bool   // some measured unit used no gas
+	EmptyCount        int
+	GasUsed           template.JS // per-unit gas, for the client-side filter
+	UnitSuiteIdx      template.JS // per-unit index into SuiteLabels
+	Scaled            bool        // too many units for per-unit charts
+	ScaleNote         string
+	RankCosts         template.JS // sorted total costs, rank on x
+	SuiteLabels       template.JS
+	SuiteMedians      template.JS
 	StatRows          []statRow
 	Labels            template.JS
 	ElapsedMs         template.JS // outer wall-clock ms per block (both targets)
@@ -545,10 +521,26 @@ type reportData struct {
 	ExecFailed        []execFailedRow
 	ValidationFails   []validationFailRow
 	Errors            []errorRow
+	Skips             []skipRow
+	Unverifieds       []skipRow
 	RawBlocks         []rawBlockRow
 }
 
+// skipRow backs both the Skipped and the Unverified tables: a unit that is
+// neither a pass nor a failure, plus why.
+type skipRow struct {
+	Unit    string
+	Suite   string
+	Network string
+	Reason  string
+}
+
 type rawBlockRow struct {
+	// Unit is the first column: the EEST test label, or the corpus block
+	// number rendered as-is so corpus reports are unchanged.
+	Unit        string
+	Suite       string
+	Network     string
 	BlockNum    uint64
 	TxCount     int
 	GasUsed     uint64
@@ -569,19 +561,23 @@ type rawBlockRow struct {
 type execFailedRow struct {
 	BlockNum uint64
 	Name     string
+	Unit     string
 	Reason   string
 }
 
 type validationFailRow struct {
 	BlockNum        uint64
 	Name            string
+	Unit            string
 	ExpectedSuccess bool
 	ExecError       string
+	Reason          string
 }
 
 type errorRow struct {
 	BlockNum uint64
 	Name     string
+	Unit     string
 	ErrMsg   string
 	Output   string
 }
@@ -594,29 +590,84 @@ type statRow struct {
 	Avg   uint64
 }
 
+// maxChartUnits is where per-unit charts stop being useful. A stacked bar with
+// five datasets over 7,390 units hangs the browser, so above this the report
+// switches to aggregate views.
+const maxChartUnits = 1500
+
+// toJS marshals chart data. Going through encoding/json rather than string
+// concatenation is what makes EEST labels safe: they contain brackets, colons,
+// commas and quotes.
+func toJS(v any) template.JS {
+	b, err := json.Marshal(v)
+	// A nil slice marshals to "null", which would break every array method the
+	// charts call on it.
+	if err != nil || string(b) == "null" {
+		return template.JS("[]")
+	}
+	return template.JS(b)
+}
+
+// unitCell is the first-column identity of a row: the EEST test label, or the
+// corpus block number rendered exactly as it was before labels existed.
+func unitCell(r BlockResult) string {
+	if r.Kind == fixture.FormatZkevm {
+		return r.Label
+	}
+	return strconv.FormatUint(r.BlockNum, 10)
+}
+
+// suiteMedians returns each suite and its median total cost, ordered by suite.
+// For the benchmark fixtures that is the comparison that matters: the same
+// workload at 10M, 30M and 60M gas.
+func suiteMedians(good []BlockResult) ([]string, []uint64) {
+	bySuite := map[string][]uint64{}
+	for _, r := range good {
+		bySuite[r.Suite] = append(bySuite[r.Suite], r.Costs.Total)
+	}
+	names := make([]string, 0, len(bySuite))
+	for s := range bySuite {
+		names = append(names, s)
+	}
+	sort.Strings(names)
+	medians := make([]uint64, len(names))
+	for i, s := range names {
+		medians[i] = computeStats(bySuite[s]).P50
+	}
+	return names, medians
+}
+
 func writeReport(path string, good []BlockResult, all []BlockResult, target string) error {
 	total := len(all)
 
-	toJS := func(vs []uint64) template.JS {
-		var sb strings.Builder
-		sb.WriteByte('[')
-		for i, v := range vs {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			sb.WriteString(strconv.FormatUint(v, 10))
+	isEEST := false
+	for _, r := range all {
+		if r.Kind == fixture.FormatZkevm {
+			isEEST = true
+			break
 		}
-		sb.WriteByte(']')
-		return template.JS(sb.String())
 	}
 
 	blockNums := make([]uint64, len(good))
+	unitLabels := make([]string, len(good))
 	elapsedMs := make([]uint64, len(good))
 	instructionCounts := make([]uint64, len(good))
 	for i, r := range good {
 		blockNums[i] = r.BlockNum
+		unitLabels[i] = r.Label
 		elapsedMs[i] = uint64(r.Elapsed.Milliseconds())
 		instructionCounts[i] = r.Costs.Instructions
+	}
+
+	// Chart labels: corpus keeps its numeric axis (marshalling []uint64 gives
+	// exactly the array the old string concatenation produced), EEST gets
+	// strings. Concatenating EEST names by hand would break the report outright,
+	// since they contain brackets, colons, commas and quotes.
+	var chartLabels template.JS
+	if isEEST {
+		chartLabels = toJS(unitLabels)
+	} else {
+		chartLabels = toJS(blockNums)
 	}
 
 	extract := func(fn func(CostReport) uint64) []uint64 {
@@ -665,37 +716,56 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 			execFailedRows = append(execFailedRows, execFailedRow{
 				BlockNum: r.BlockNum,
 				Name:     r.Name,
+				Unit:     unitCell(r),
 				Reason:   r.ExecError,
 			})
 		}
-		if r.Err == nil && !r.ValidationOK {
+		if r.Err == nil && r.Verdict.Kind == verdictFail {
 			validationFailRows = append(validationFailRows, validationFailRow{
 				BlockNum:        r.BlockNum,
 				Name:            r.Name,
+				Unit:            unitCell(r),
 				ExpectedSuccess: r.ExpectedSuccess,
 				ExecError:       r.ExecError,
+				Reason:          r.Verdict.Reason,
 			})
 		}
 	}
-	sort.Slice(execFailedRows, func(i, j int) bool { return execFailedRows[i].BlockNum < execFailedRows[j].BlockNum })
-	sort.Slice(validationFailRows, func(i, j int) bool { return validationFailRows[i].BlockNum < validationFailRows[j].BlockNum })
+	sort.SliceStable(execFailedRows, func(i, j int) bool { return execFailedRows[i].Unit < execFailedRows[j].Unit })
+	sort.SliceStable(validationFailRows, func(i, j int) bool { return validationFailRows[i].Unit < validationFailRows[j].Unit })
 
 	var errRows []errorRow
+	var skipRows, unverifiedRows []skipRow
 	for _, r := range all {
 		if r.Err != nil {
 			errRows = append(errRows, errorRow{
 				BlockNum: r.BlockNum,
 				Name:     r.Name,
+				Unit:     unitCell(r),
 				ErrMsg:   r.Err.Error(),
 				Output:   r.ErrOutput,
 			})
 		}
+		// Skipped and unverified units get their own tables rather than joining
+		// the Errors table, so a mixed-fork tree does not render thousands of
+		// red rows.
+		switch r.Verdict.Kind {
+		case verdictSkip:
+			skipRows = append(skipRows, skipRow{unitCell(r), r.Suite, r.Network, r.Verdict.Reason})
+		case verdictUnverified:
+			unverifiedRows = append(unverifiedRows, skipRow{unitCell(r), r.Suite, r.Network, r.Verdict.Reason})
+		}
 	}
-	sort.Slice(errRows, func(i, j int) bool { return errRows[i].BlockNum < errRows[j].BlockNum })
+	sort.SliceStable(errRows, func(i, j int) bool { return errRows[i].Unit < errRows[j].Unit })
+	sort.SliceStable(skipRows, func(i, j int) bool { return skipRows[i].Unit < skipRows[j].Unit })
+	sort.SliceStable(unverifiedRows, func(i, j int) bool { return unverifiedRows[i].Unit < unverifiedRows[j].Unit })
 
 	rawBlocks := make([]rawBlockRow, len(good))
 	for i, r := range good {
 		row := rawBlockRow{
+			Unit:        unitCell(r),
+			Suite:       r.Suite,
+			Network:     r.Network,
 			BlockNum:    r.BlockNum,
 			TxCount:     r.TxCount,
 			GasUsed:     r.GasUsed,
@@ -706,13 +776,64 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 			Memory:      r.Costs.Memory,
 			Total:       r.Costs.Total,
 		}
-		if b, err := hex.DecodeString(r.OutputHex); err == nil && len(b) >= 43 {
-			row.PayloadRoot = hex.EncodeToString(b[0:32])
-			row.Success = b[32] == 0x01
-			row.ChainID = binary.LittleEndian.Uint64(b[33:41])
-			row.SchemaID = binary.LittleEndian.Uint16(b[41:43])
+		if o := decodeStatelessOutput(r.OutputHex); o.OK {
+			row.PayloadRoot = o.PayloadRoot
+			row.Success = o.Success
+			row.ChainID = o.ChainID
+			row.SchemaID = o.SchemaID
 		}
 		rawBlocks[i] = row
+	}
+
+	unitColumn, unitAxis := "Block", "Block Number"
+	if isEEST {
+		unitColumn, unitAxis = "Test", "Test"
+	}
+
+	// Above maxChartUnits, per-unit charts are replaced by a rank-ordered cost
+	// curve and a per-suite median bar. The swap is stated in the report rather
+	// than left for the reader to infer from a missing chart.
+	scaled := len(good) > maxChartUnits
+	var (
+		scaleNote  string
+		rankCosts  []uint64
+		suiteNames []string
+		suiteMeds  []uint64
+	)
+	if scaled {
+		scaleNote = fmt.Sprintf(
+			"%d units exceeds the %d-unit per-unit chart limit; showing the cost distribution and per-suite medians instead.",
+			len(good), maxChartUnits)
+		rankCosts = extract(func(c CostReport) uint64 { return c.Total })
+		sort.Slice(rankCosts, func(i, j int) bool { return rankCosts[i] < rankCosts[j] })
+		suiteNames, suiteMeds = suiteMedians(good)
+	}
+
+	// Zero-gas units are executed and validated like any other, but they all sit
+	// at the base-cost floor. In the EEST benchmark trees they are over half of
+	// all units, which drags the blended P50 far below the P50 of the units that
+	// actually computed something. Rather than pick one view, ship the per-unit
+	// gas and let the report toggle between them.
+	gasPerUnit := make([]uint64, len(good))
+	emptyCount := 0
+	for i, r := range good {
+		gasPerUnit[i] = r.GasUsed
+		if r.GasUsed == 0 {
+			emptyCount++
+		}
+	}
+	// The suite chart has to be recomputable client-side too, so emit each
+	// unit's suite as an index into a deduplicated name list.
+	if suiteNames == nil {
+		suiteNames, _ = suiteMedians(good)
+	}
+	suiteIdx := make(map[string]int, len(suiteNames))
+	for i, n := range suiteNames {
+		suiteIdx[n] = i
+	}
+	unitSuite := make([]int, len(good))
+	for i, r := range good {
+		unitSuite[i] = suiteIdx[r.Suite]
 	}
 
 	data := reportData{
@@ -723,7 +844,22 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		Failed:            len(execFailedRows),
 		ValidationFailed:  len(validationFailRows),
 		StatRows:          statRows,
-		Labels:            toJS(blockNums),
+		Skipped:           len(skipRows),
+		Unverified:        len(unverifiedRows),
+		IsEEST:            isEEST,
+		UnitColumn:        unitColumn,
+		UnitAxis:          unitAxis,
+		Scaled:            scaled,
+		ScaleNote:         scaleNote,
+		SuiteChartHeight:  suiteChartHeight(len(suiteNames)),
+		HasEmptyUnits:     emptyCount > 0,
+		EmptyCount:        emptyCount,
+		GasUsed:           toJS(gasPerUnit),
+		UnitSuiteIdx:      toJS(unitSuite),
+		RankCosts:         toJS(rankCosts),
+		SuiteLabels:       toJS(suiteNames),
+		SuiteMedians:      toJS(suiteMeds),
+		Labels:            chartLabels,
 		ElapsedMs:         toJS(elapsedMs),
 		InstructionCounts: toJS(instructionCounts),
 		TotalCosts:        toJS(extract(func(c CostReport) uint64 { return c.Total })),
@@ -735,6 +871,8 @@ func writeReport(path string, good []BlockResult, all []BlockResult, target stri
 		ExecFailed:        execFailedRows,
 		ValidationFails:   validationFailRows,
 		Errors:            errRows,
+		Skips:             skipRows,
+		Unverifieds:       unverifiedRows,
 		RawBlocks:         rawBlocks,
 	}
 
@@ -768,6 +906,17 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   .chart-wrap { background: #fff; border-radius: 8px; padding: 1rem; margin-bottom: 2rem;
                 box-shadow: 0 1px 4px rgba(0,0,0,.1); max-width: 1100px; }
   canvas { max-height: 400px; }
+  /* Charts whose category count drives their height opt out of the cap. */
+  .chart-tall canvas { max-height: none; }
+  .toolbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center;
+             gap: 1rem; flex-wrap: wrap; margin: 0 0 1rem; padding: .7rem 1rem;
+             background: #fff; border: 1px solid #dee2e6; border-left: 4px solid #0d6efd;
+             border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,.08); max-width: 1100px; }
+  .toolbar label { display: inline-flex; align-items: center; gap: .45rem; cursor: pointer;
+                   font-weight: 600; font-size: .95rem; }
+  .toolbar input[type=checkbox] { width: 1.05rem; height: 1.05rem; cursor: pointer; margin: 0; }
+  .toolbar .scope { color: #6c757d; font-size: .85rem; font-weight: 400; }
+  .toolbar .hint { color: #6c757d; font-size: .8rem; flex-basis: 100%; margin: 0; }
   #execFailTable { max-width: 600px; }
   #execFailTable td:first-child { width: 10rem; }
   #errTable { max-width: 1100px; }
@@ -777,12 +926,26 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 </head>
 <body>
 <h1>zesu-zkvm Benchmark Report <span class="target-badge">{{.Target}}</span></h1>
-<p class="meta">Generated: {{.Generated}} &nbsp;|&nbsp; Blocks: {{.Good}}/{{.Total}} succeeded{{if .ValidationFailed}} &nbsp;|&nbsp; <span style="color:#dc3545">{{.ValidationFailed}} validation failure(s)</span>{{end}}{{if .Failed}} &nbsp;|&nbsp; {{.Failed}} expected failure(s){{end}}</p>
+<p class="meta">Generated: {{.Generated}} &nbsp;|&nbsp; Blocks: {{.Good}}/{{.Total}} succeeded{{if .ValidationFailed}} &nbsp;|&nbsp; <span style="color:#dc3545">{{.ValidationFailed}} validation failure(s)</span>{{end}}{{if .Failed}} &nbsp;|&nbsp; {{.Failed}} expected failure(s){{end}}{{if .Unverified}} &nbsp;|&nbsp; {{.Unverified}} unverified{{end}}{{if .Skipped}} &nbsp;|&nbsp; {{.Skipped}} skipped{{end}}</p>
 
 <h2>Summary</h2>
+{{if .HasEmptyUnits}}
+<div class="toolbar">
+  <label for="excludeEmpty">
+    <input type="checkbox" id="excludeEmpty">
+    Exclude zero-gas units ({{.EmptyCount}})
+  </label>
+  <span class="scope" id="statScope">{{.Good}} units, including {{.EmptyCount}} that used no gas</span>
+  <p class="hint">
+    Zero-gas units ran and validated normally but sit at the base-cost floor. With them included the
+    median reflects fixture scaffolding rather than executed work. Applies to the stats, charts and
+    the raw table below.
+  </p>
+</div>
+{{end}}
 <table>
   <thead><tr><th>Component</th><th>Min</th><th>P50</th><th>Max</th><th>Avg</th></tr></thead>
-  <tbody>
+  <tbody id="statBody">
   {{range .StatRows}}
   <tr>
     <td>{{.Label}}</td>
@@ -795,6 +958,15 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   </tbody>
 </table>
 
+{{if .Scaled}}
+<p class="meta">{{.ScaleNote}}</p>
+
+<h2>Total Cost Distribution (sorted by rank)</h2>
+<div class="chart-wrap"><canvas id="rankChart"></canvas></div>
+
+<h2>Median Total Cost by Suite</h2>
+<div class="chart-wrap chart-tall" style="height:{{.SuiteChartHeight}}px"><canvas id="suiteChart"></canvas></div>
+{{else}}
 {{if eq .Target "openvm"}}
 <h2>Instruction Count by Block</h2>
 <div class="chart-wrap"><canvas id="instructionChart"></canvas></div>
@@ -810,17 +982,18 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 <h2>Cost Breakdown by Block</h2>
 <div class="chart-wrap"><canvas id="stackedChart"></canvas></div>
 {{end}}
+{{end}}
 
 {{if .ValidationFails}}
 <h2>Validation Failures ({{len .ValidationFails}} blocks)</h2>
 <table id="validationFailTable">
-  <thead><tr><th>Block</th><th>Expected</th><th>Got</th></tr></thead>
+  <thead><tr><th>{{.UnitColumn}}</th><th>Expected</th><th>Got</th></tr></thead>
   <tbody>
   {{range .ValidationFails}}
   <tr>
-    <td style="white-space:nowrap;font-family:monospace">{{.BlockNum}}</td>
+    <td style="white-space:nowrap;font-family:monospace">{{.Unit}}</td>
     <td>{{if .ExpectedSuccess}}success{{else}}failure{{end}}</td>
-    <td style="color:#dc3545">{{if .ExecError}}failed: {{.ExecError}}{{else}}success{{end}}</td>
+    <td style="color:#dc3545">{{if .Reason}}{{.Reason}}{{else}}{{if .ExecError}}failed: {{.ExecError}}{{else}}success{{end}}{{end}}</td>
   </tr>
   {{end}}
   </tbody>
@@ -830,11 +1003,11 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 {{if .ExecFailed}}
 <h2>Expected Failures ({{len .ExecFailed}} blocks)</h2>
 <table id="execFailTable">
-  <thead><tr><th>Block</th><th>Reason</th></tr></thead>
+  <thead><tr><th>{{.UnitColumn}}</th><th>Reason</th></tr></thead>
   <tbody>
   {{range .ExecFailed}}
   <tr>
-    <td style="white-space:nowrap;font-family:monospace">{{.BlockNum}}</td>
+    <td style="white-space:nowrap;font-family:monospace">{{.Unit}}</td>
     <td style="font-family:monospace;color:#6c757d">{{.Reason}}</td>
   </tr>
   {{end}}
@@ -845,11 +1018,11 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 {{if .Errors}}
 <h2>Errors ({{len .Errors}} blocks)</h2>
 <table id="errTable">
-  <thead><tr><th>Block</th><th>Error</th></tr></thead>
+  <thead><tr><th>{{.UnitColumn}}</th><th>Error</th></tr></thead>
   <tbody>
   {{range .Errors}}
   <tr>
-    <td style="white-space:nowrap">{{.BlockNum}}</td>
+    <td style="white-space:nowrap">{{.Unit}}</td>
     <td>
       <details>
         <summary style="cursor:pointer;font-family:monospace">{{.ErrMsg}}</summary>
@@ -862,15 +1035,49 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 </table>
 {{end}}
 
+{{if .Unverifieds}}
+<h2>Unverified ({{len .Unverifieds}} units)</h2>
+<p class="meta">Ran, but the fixture carries no expected output to compare against — neither a pass nor a failure.</p>
+<table id="unverifiedTable" style="max-width:1100px">
+  <thead><tr><th>{{.UnitColumn}}</th><th>Network</th><th>Reason</th></tr></thead>
+  <tbody>
+  {{range .Unverifieds}}
+  <tr>
+    <td style="font-family:monospace">{{.Unit}}</td>
+    <td>{{.Network}}</td>
+    <td style="color:#6c757d">{{.Reason}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+{{if .Skips}}
+<h2>Skipped ({{len .Skips}} units)</h2>
+<p class="meta">Not runnable by this tool — no stateless input in the fixture.</p>
+<table id="skipTable" style="max-width:1100px">
+  <thead><tr><th>{{.UnitColumn}}</th><th>Network</th><th>Reason</th></tr></thead>
+  <tbody>
+  {{range .Skips}}
+  <tr>
+    <td style="font-family:monospace">{{.Unit}}</td>
+    <td>{{.Network}}</td>
+    <td style="color:#6c757d">{{.Reason}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
 {{if .RawBlocks}}
 <h2>Raw Block Data</h2>
-<input id="rawSearch" type="text" placeholder="Filter by block number..." style="margin-bottom:.5rem;padding:.3rem .6rem;font-size:.9rem;border:1px solid #dee2e6;border-radius:4px;width:220px">
+<input id="rawSearch" type="text" placeholder="Filter by {{if .IsEEST}}test name{{else}}block number{{end}}..." style="margin-bottom:.5rem;padding:.3rem .6rem;font-size:.9rem;border:1px solid #dee2e6;border-radius:4px;width:220px">
 <label style="margin-left:.75rem;font-size:.9rem;cursor:pointer"><input type="checkbox" id="failOnly" style="margin-right:.3rem">Failures only</label>
 <div style="overflow-x:auto;max-width:100%">
 <table id="rawTable" style="font-size:.82rem;min-width:900px">
   <thead>
   <tr>
-    <th onclick="sortTable(0)" style="cursor:pointer;white-space:nowrap">Block ↕</th>
+    <th onclick="sortTable(0)" style="cursor:pointer;white-space:nowrap">{{.UnitColumn}} ↕</th>
     <th onclick="sortTable(1)" style="cursor:pointer">TxCount ↕</th>
     <th onclick="sortTable(2)" style="cursor:pointer">GasUsed ↕</th>
     <th onclick="sortTable(3)" style="cursor:pointer">Base ↕</th>
@@ -886,7 +1093,7 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   <tbody id="rawBody">
   {{range .RawBlocks}}
   <tr{{if not .Success}} class="row-fail"{{end}}>
-    <td style="font-family:monospace">{{.BlockNum}}</td>
+    <td style="font-family:monospace">{{.Unit}}</td>
     <td>{{.TxCount}}</td>
     <td>{{.GasUsed}}</td>
     <td>{{.Base}}</td>
@@ -906,6 +1113,11 @@ var reportTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 
 <script>
 const labels             = {{.Labels}};
+const gasUsed            = {{.GasUsed}};
+const unitSuiteIdx       = {{.UnitSuiteIdx}};
+const rankCosts          = {{.RankCosts}};
+const suiteLabels        = {{.SuiteLabels}};
+const suiteMedians       = {{.SuiteMedians}};
 const elapsedMs          = {{.ElapsedMs}};
 const instructionCounts  = {{.InstructionCounts}};
 const totalCosts         = {{.TotalCosts}};
@@ -915,7 +1127,90 @@ const opCosts    = {{.OpCosts}};
 const preCosts   = {{.PreCosts}};
 const memCosts   = {{.MemCosts}};
 
-{{if eq .Target "openvm"}}
+// Per-unit charts are labelled by block number for corpus runs and by test name
+// for EEST runs. Test names are far too long for an axis, so abbreviate the tick
+// and keep the full name in the tooltip.
+const unitTicks = {{if .IsEEST}}{
+  autoSkip: true, maxRotation: 0, font: { size: 10 },
+  callback: function (v) {
+    const s = String(this.getLabelForValue(v));
+    const short = s.slice(s.lastIndexOf('::') + 2);
+    return short.length > 24 ? short.slice(0, 23) + '…' : short;
+  }
+}{{else}}{}{{end}};
+const unitTooltip = { callbacks: { title: items => items[0].label } };
+
+
+{{if .Scaled}}
+const rankChartObj = new Chart(document.getElementById('rankChart'), {
+  type: 'line',
+  data: {
+    labels: rankCosts.map((_, i) => i + 1),
+    datasets: [{
+      label: 'TOTAL COST',
+      data: rankCosts,
+      borderColor: '#0d6efd',
+      backgroundColor: 'rgba(13,110,253,0.08)',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      fill: true,
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { title: { display: true, text: 'Unit rank (cheapest to most expensive)' } },
+      y: { title: { display: true, text: 'Cost' }, beginAtZero: true }
+    }
+  }
+});
+
+// Suite names share a long leading path ("compute/instruction/..."); strip the
+// common prefix for the axis and keep the full name in the tooltip.
+function commonPrefix(xs) {
+  if (xs.length < 2) return '';
+  let p = xs[0];
+  for (const x of xs) {
+    while (p && !x.startsWith(p)) p = p.slice(0, -1);
+    if (!p) break;
+  }
+  const cut = p.lastIndexOf('/');
+  return cut > 0 ? p.slice(0, cut + 1) : '';
+}
+const suitePrefix = commonPrefix(suiteLabels);
+const shortSuite = s => (suitePrefix && s.startsWith(suitePrefix)) ? s.slice(suitePrefix.length) : s;
+
+const suiteChartObj = new Chart(document.getElementById('suiteChart'), {
+  type: 'bar',
+  data: {
+    labels: suiteLabels,
+    datasets: [{ label: 'Median TOTAL COST', data: suiteMedians, backgroundColor: '#198754' }]
+  },
+  options: {
+    responsive: true,
+    // The wrapper's height is sized from the category count, so fill it rather
+    // than holding an aspect ratio.
+    maintainAspectRatio: false,
+    indexAxis: 'y',
+    layout: { padding: { right: 24 } },
+    plugins: {
+      legend: { display: false },
+      tooltip: { callbacks: { title: items => items[0].label } },
+      title: suitePrefix ? { display: true, align: 'start', text: 'suite prefix: ' + suitePrefix,
+                             color: '#6c757d', font: { weight: 'normal', size: 11 } } : { display: false }
+    },
+    scales: {
+      x: { title: { display: true, text: 'Cost' }, beginAtZero: true },
+      // autoSkip is what dropped the labels; every suite must keep its tick.
+      y: { ticks: { autoSkip: false, crossAlign: 'far', font: { size: 11 },
+                    callback: function (v) { return shortSuite(this.getLabelForValue(v)); } } }
+    }
+  }
+});
+{{end}}
+
+{{if and (not .Scaled) (eq .Target "openvm")}}
 new Chart(document.getElementById('instructionChart'), {
   type: 'line',
   data: {
@@ -933,16 +1228,17 @@ new Chart(document.getElementById('instructionChart'), {
   },
   options: {
     responsive: true,
-    plugins: { legend: { display: false } },
+    plugins: { legend: { display: false }, tooltip: unitTooltip },
     scales: {
-      x: { title: { display: true, text: 'Block Number' } },
+      x: { title: { display: true, text: '{{.UnitAxis}}' }, ticks: unitTicks },
       y: { title: { display: true, text: 'Retired Instructions' }, beginAtZero: true }
     }
   }
 });
 {{end}}
 
-new Chart(document.getElementById('elapsedChart'), {
+{{if not .Scaled}}
+const elapsedChartObj = new Chart(document.getElementById('elapsedChart'), {
   type: 'line',
   data: {
     labels,
@@ -959,13 +1255,14 @@ new Chart(document.getElementById('elapsedChart'), {
   },
   options: {
     responsive: true,
-    plugins: { legend: { display: false } },
+    plugins: { legend: { display: false }, tooltip: unitTooltip },
     scales: {
-      x: { title: { display: true, text: 'Block Number' } },
+      x: { title: { display: true, text: '{{.UnitAxis}}' }, ticks: unitTicks },
       y: { title: { display: true, text: 'ms' }, beginAtZero: true }
     }
   }
 });
+{{end}}
 
 let sortDir = {};
 function sortTable(col) {
@@ -986,20 +1283,112 @@ function sortTable(col) {
 }
 const rawSearch = document.getElementById('rawSearch');
 const failOnly = document.getElementById('failOnly');
+const excludeEmpty = document.getElementById('excludeEmpty');
+
+function skipEmpty() { return excludeEmpty ? excludeEmpty.checked : false; }
+
 function applyRawFilters() {
   const q = rawSearch ? rawSearch.value.trim() : '';
   const fo = failOnly ? failOnly.checked : false;
+  const se = skipEmpty();
   Array.from(document.getElementById('rawBody').rows).forEach(r => {
     const blockMatch = r.cells[0].textContent.includes(q);
     const failMatch = !fo || r.classList.contains('row-fail');
-    r.style.display = (blockMatch && failMatch) ? '' : 'none';
+    // Column 2 is GasUsed.
+    const gasMatch = !se || Number(r.cells[2].textContent.trim()) > 0;
+    r.style.display = (blockMatch && failMatch && gasMatch) ? '' : 'none';
   });
 }
 if (rawSearch) rawSearch.addEventListener('input', applyRawFilters);
 if (failOnly) failOnly.addEventListener('change', applyRawFilters);
 
-{{if eq .Target "zisk"}}
-new Chart(document.getElementById('totalChart'), {
+// ── zero-gas toggle ───────────────────────────────────────────────────────────
+// Mirrors computeStats in bench/main.go exactly: P50 is the element at
+// floor(n/2) of the sorted values, and Avg is integer division. Any divergence
+// here would put the report and the console summary quietly at odds.
+function statsOf(vals) {
+  if (!vals.length) return {min: 0, p50: 0, max: 0, avg: 0};
+  const s = vals.slice().sort((a, b) => a - b);
+  let sum = 0;
+  for (const v of s) sum += v;
+  return {min: s[0], p50: s[Math.floor(s.length / 2)], max: s[s.length - 1],
+          avg: Math.floor(sum / s.length)};
+}
+
+// Indices of the units currently in scope.
+function scopeIdx() {
+  const se = skipEmpty();
+  const out = [];
+  for (let i = 0; i < gasUsed.length; i++) if (!se || gasUsed[i] > 0) out.push(i);
+  return out;
+}
+const pick = (arr, idx) => idx.map(i => arr[i]);
+
+const statSeries = {{if eq .Target "openvm"}}[['INSTRUCTIONS', instructionCounts]]{{else}}[
+  ['BASE', baseCosts], ['MAIN', mainCosts], ['OPCODES', opCosts],
+  ['PRECOMPILES', preCosts], ['MEMORY', memCosts], ['TOTAL', totalCosts]
+]{{end}};
+
+function refresh() {
+  const idx = scopeIdx();
+
+  const body = document.getElementById('statBody');
+  if (body) {
+    body.innerHTML = statSeries.map(([label, series]) => {
+      const s = statsOf(pick(series, idx));
+      return '<tr><td>' + label + '</td><td>' + s.min + '</td><td>' + s.p50 +
+             '</td><td>' + s.max + '</td><td>' + s.avg + '</td></tr>';
+    }).join('');
+  }
+
+  const scope = document.getElementById('statScope');
+  if (scope) {
+    scope.textContent = skipEmpty()
+      ? idx.length + ' units that used gas (' + (gasUsed.length - idx.length) + ' zero-gas excluded)'
+      : gasUsed.length + ' units, including ' + (gasUsed.length - idx.length ||
+          gasUsed.filter(g => g === 0).length) + ' that used no gas';
+  }
+
+  if (typeof rankChartObj !== 'undefined') {
+    const sorted = pick(totalCosts, idx).sort((a, b) => a - b);
+    rankChartObj.data.labels = sorted.map((_, i) => i + 1);
+    rankChartObj.data.datasets[0].data = sorted;
+    rankChartObj.update();
+  }
+
+  if (typeof suiteChartObj !== 'undefined') {
+    const bySuite = new Map();
+    for (const i of idx) {
+      const k = unitSuiteIdx[i];
+      if (!bySuite.has(k)) bySuite.set(k, []);
+      bySuite.get(k).push(totalCosts[i]);
+    }
+    const keys = Array.from(bySuite.keys()).sort((a, b) => a - b);
+    suiteChartObj.data.labels = keys.map(k => suiteLabels[k]);
+    suiteChartObj.data.datasets[0].data = keys.map(k => statsOf(bySuite.get(k)).p50);
+    suiteChartObj.update();
+  }
+
+  for (const [obj, series] of [[typeof totalChartObj !== 'undefined' ? totalChartObj : null, totalCosts],
+                               [typeof elapsedChartObj !== 'undefined' ? elapsedChartObj : null, elapsedMs]]) {
+    if (!obj) continue;
+    obj.data.labels = pick(labels, idx);
+    obj.data.datasets[0].data = pick(series, idx);
+    obj.update();
+  }
+  if (typeof stackedChartObj !== 'undefined') {
+    stackedChartObj.data.labels = pick(labels, idx);
+    const series = [baseCosts, mainCosts, opCosts, preCosts, memCosts];
+    stackedChartObj.data.datasets.forEach((d, i) => { d.data = pick(series[i], idx); });
+    stackedChartObj.update();
+  }
+
+  applyRawFilters();
+}
+if (excludeEmpty) excludeEmpty.addEventListener('change', refresh);
+
+{{if and (not .Scaled) (eq .Target "zisk")}}
+const totalChartObj = new Chart(document.getElementById('totalChart'), {
   type: 'line',
   data: {
     labels,
@@ -1016,15 +1405,15 @@ new Chart(document.getElementById('totalChart'), {
   },
   options: {
     responsive: true,
-    plugins: { legend: { display: false } },
+    plugins: { legend: { display: false }, tooltip: unitTooltip },
     scales: {
-      x: { title: { display: true, text: 'Block Number' } },
+      x: { title: { display: true, text: '{{.UnitAxis}}' }, ticks: unitTicks },
       y: { title: { display: true, text: 'Cost' }, beginAtZero: true }
     }
   }
 });
 
-new Chart(document.getElementById('stackedChart'), {
+const stackedChartObj = new Chart(document.getElementById('stackedChart'), {
   type: 'bar',
   data: {
     labels,
@@ -1038,9 +1427,9 @@ new Chart(document.getElementById('stackedChart'), {
   },
   options: {
     responsive: true,
-    plugins: { legend: { position: 'top' } },
+    plugins: { legend: { position: 'top' }, tooltip: unitTooltip },
     scales: {
-      x: { stacked: true, title: { display: true, text: 'Block Number' } },
+      x: { stacked: true, title: { display: true, text: '{{.UnitAxis}}' }, ticks: unitTicks },
       y: { stacked: true, title: { display: true, text: 'Cost' }, beginAtZero: true }
     }
   }
@@ -1050,25 +1439,3 @@ new Chart(document.getElementById('stackedChart'), {
 </body>
 </html>
 `))
-
-func collectJSON(path string) ([]string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() {
-		return []string{path}, nil
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return nil, err
-	}
-	var paths []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
-			paths = append(paths, filepath.Join(path, e.Name()))
-		}
-	}
-	sort.Strings(paths)
-	return paths, nil
-}

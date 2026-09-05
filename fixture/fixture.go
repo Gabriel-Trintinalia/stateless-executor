@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 )
 
 // FixtureFile is the top-level JSON fixture format.
@@ -215,20 +216,50 @@ func LoadFile(path string) (*FixtureFile, error) {
 	return &f, nil
 }
 
-// ZkevmWitness holds the execution witness arrays from a zkevm blockchain test block.
-type ZkevmWitness struct {
-	State   []string `json:"state"`
-	Codes   []string `json:"codes"`
-	Headers []string `json:"headers"`
+// ZkevmHeader carries the few header fields worth reporting per block. The
+// stateless input itself is opaque hex, so these are the only way to get a
+// block number and a gas figure without decoding SSZ.
+type ZkevmHeader struct {
+	Number  string `json:"number"`  // e.g. "0x01"
+	GasUsed string `json:"gasUsed"` // e.g. "0x039386aa"
+}
+
+// ZkevmTx is one transaction, reduced to the field the per-type counts need.
+// Type is a quoted two-hex-digit string: "0x00" … "0x04".
+type ZkevmTx struct {
+	Type string `json:"type"`
 }
 
 // ZkevmBlock is one block inside a zkevm blockchain test case.
+//
+// executionWitness is deliberately not parsed. It is the bulk of each block's
+// JSON — one benchmark fixture reaches 550 MB — and nothing reads it: the guest
+// input arrives pre-encoded in StatelessInputBytes.
 type ZkevmBlock struct {
-	ExecutionWitness     ZkevmWitness `json:"executionWitness"`
-	StatelessInputBytes  string       `json:"statelessInputBytes"`  // hex-encoded SSZ SszStatelessInput (Amsterdam+)
-	StatelessOutputBytes string       `json:"statelessOutputBytes"` // hex-encoded expected SSZ output
+	BlockHeader          ZkevmHeader `json:"blockHeader"`
+	Transactions         []ZkevmTx   `json:"transactions"`
+	StatelessInputBytes  string      `json:"statelessInputBytes"`  // hex-encoded SSZ SszStatelessInput (Amsterdam+)
+	StatelessOutputBytes string      `json:"statelessOutputBytes"` // hex-encoded expected SSZ output
 	// ExpectException is non-empty for blocks that are expected to be invalid.
 	ExpectException string `json:"expectException"`
+}
+
+// Number returns the block's header number, or 0 if absent or malformed.
+func (b *ZkevmBlock) Number() uint64 {
+	n, err := hexToUint64(b.BlockHeader.Number)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// GasUsed returns the block's header gasUsed, or 0 if absent or malformed.
+func (b *ZkevmBlock) GasUsed() uint64 {
+	n, err := hexToUint64(b.BlockHeader.GasUsed)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // ZkevmTestCase is one test case in the zkevm blockchain test format.
@@ -238,8 +269,13 @@ type ZkevmTestCase struct {
 	Blocks  []ZkevmBlock `json:"blocks"`
 }
 
-// LoadZkevmFile reads a zkevm blockchain test JSON file and returns all test cases.
-// The format has one or more top-level keys, each naming a test case.
+// LoadZkevmFile reads a zkevm blockchain test JSON file and returns all test
+// cases, ordered by name.
+//
+// The format has one or more top-level keys, each naming a test case. Those keys
+// land in a Go map, whose iteration order is randomised per run, so the sort is
+// what makes the returned order — and therefore any caller's output ordering —
+// reproducible.
 func LoadZkevmFile(path string) ([]*ZkevmTestCase, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -249,10 +285,16 @@ func LoadZkevmFile(path string) ([]*ZkevmTestCase, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	var out []*ZkevmTestCase
-	for name, v := range raw {
+	names := make([]string, 0, len(raw))
+	for name := range raw {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]*ZkevmTestCase, 0, len(names))
+	for _, name := range names {
 		var tc ZkevmTestCase
-		if err := json.Unmarshal(v, &tc); err != nil {
+		if err := json.Unmarshal(raw[name], &tc); err != nil {
 			return nil, fmt.Errorf("parse test %q in %s: %w", name, path, err)
 		}
 		tc.Name = name
