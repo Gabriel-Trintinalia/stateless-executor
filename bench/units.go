@@ -283,10 +283,31 @@ func verifyEEST(enc encoded, r emuResult, runErr error) verdict {
 	if !v.OutputMatch {
 		v.Kind = verdictFail
 		v.Reason = "output mismatch"
+		if msg := guestPanicMsg(r.RawOut); msg != "" {
+			v.Reason = "output mismatch (panic: " + msg + ")"
+		}
 		return v
 	}
 	v.Kind = verdictPass
 	return v
+}
+
+// guestPanicMsg extracts any guest-emitted message that appears before the
+// COST DISTRIBUTION header. The panic handler prints to the UART before calling
+// zkvm_abort(), so these lines land in combined stdout+stderr ahead of the cost
+// table. Returns "" when the output is clean.
+func guestPanicMsg(rawOut string) string {
+	var msgs []string
+	for _, line := range strings.Split(rawOut, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "COST") || strings.HasPrefix(line, "REPORT") || strings.HasPrefix(line, "---") {
+			break
+		}
+		if line != "" {
+			msgs = append(msgs, line)
+		}
+	}
+	return strings.Join(msgs, "; ")
 }
 
 // verifyCorpus is the corpus rule, unchanged: the guest's success is compared
