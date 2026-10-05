@@ -44,7 +44,8 @@ func main() {
 		}
 		log.Printf("genesis: chainId=%d forks=%d", genesis.ChainID, genesis.ForkCount())
 	} else {
-		log.Printf("GENESIS_FILE not set — using hardcoded Amsterdam mainnet chain config")
+		genesis = fixture.DefaultMainnetChainConfig()
+		log.Printf("GENESIS_FILE not set — using default mainnet chain config (chainId=%d forks=%d)", genesis.ChainID, genesis.ForkCount())
 	}
 
 	guests, err := runner.ParseGuestSpecs(os.Getenv("GUEST_BINARIES"))
