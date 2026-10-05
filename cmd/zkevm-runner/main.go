@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	zkevm-runner --fixtures <dir> --elf <path> [--ziskemu <path>] [--jobs N]
+//	zkevm-runner --fixtures <dir> --elf <path> [--target zisk|openvm] [--zkvmPath <path>] [--jobs N]
 package main
 
 import (
@@ -42,8 +42,10 @@ type TestResult struct {
 func main() {
 	fixturesDir := flag.String("fixtures", "", "directory containing zkevm blockchain test JSON files (required)")
 	elfPath := flag.String("elf", "", "path to the zesu-zkvm ELF binary (required unless -dump-dir is set)")
-	ziskemuPath := flag.String("ziskemu", "ziskemu", "path to ziskemu binary (zisk-0.17+)")
-	jobs := flag.Int("jobs", 1, "number of parallel ziskemu runs")
+	targetFlag := flag.String("target", "zisk", "zkVM target: zisk or openvm")
+	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM)")
+	ziskemuPath := flag.String("ziskemu", "ziskemu", "path to ziskemu binary; superseded by --zkvmPath")
+	jobs := flag.Int("jobs", 1, "number of parallel emulator runs")
 	reportPath := flag.String("report", "", "output HTML report path (omit to skip)")
 	dumpDir := flag.String("dump-dir", "", "if set, write encoded .bin input files here instead of running ziskemu")
 	flag.Parse()
@@ -51,6 +53,16 @@ func main() {
 	if *fixturesDir == "" {
 		flag.Usage()
 		os.Exit(1)
+	}
+	if *targetFlag != "zisk" && *targetFlag != "openvm" {
+		log.Fatalf("unknown target %q: must be zisk or openvm", *targetFlag)
+	}
+	if *zkvmPath == "" {
+		if *targetFlag == "openvm" {
+			*zkvmPath = "zesu-openvm-runner"
+		} else {
+			*zkvmPath = *ziskemuPath
+		}
 	}
 	if *dumpDir == "" && *elfPath == "" {
 		log.Fatalf("-elf is required when -dump-dir is not set")
@@ -74,7 +86,7 @@ func main() {
 		}
 		log.Printf("found %d fixture files, dumping .bin inputs to %s...", len(paths), *dumpDir)
 	} else {
-		log.Printf("found %d fixture files, running with ziskemu (%d job(s))...", len(paths), *jobs)
+		log.Printf("found %d fixture files, running with %s/%s (%d job(s))...", len(paths), *targetFlag, *zkvmPath, *jobs)
 	}
 
 	// Each JSON file may contain multiple test cases, each with multiple blocks.
@@ -130,11 +142,11 @@ func main() {
 			if *dumpDir != "" {
 				runErr = dumpOne(it.tc, it.block, idx, *dumpDir)
 			} else {
-				gotSuccess, gotOutputHex, rawOut, runErr = runOne(it.tc, it.block, *elfPath, *ziskemuPath)
+				gotSuccess, gotOutputHex, rawOut, runErr = runOne(it.tc, it.block, *elfPath, *zkvmPath, *targetFlag)
 			}
 			elapsed := time.Since(t)
 			expectedOutputHex := strings.ToLower(strings.TrimPrefix(it.block.StatelessOutputBytes, "0x"))
-			// ziskemu's -o writes the full output region (zero-padded), so trim got to expected's length.
+			// The emulator's -o writes the full output region (zero-padded), so trim got to expected's length.
 			gotOutputCmp := gotOutputHex
 			if len(expectedOutputHex) > 0 && len(gotOutputCmp) > len(expectedOutputHex) {
 				gotOutputCmp = gotOutputCmp[:len(expectedOutputHex)]
@@ -230,7 +242,7 @@ func dumpOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, idx int, dir 
 // The emulator invocation itself lives in package emu, shared with the bench
 // tool, so there is one place that builds the command line and one place that
 // detects a step-capped run.
-func runOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, elfPath, ziskemuPath string) (bool, string, string, error) {
+func runOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, elfPath, zkvmPath, target string) (bool, string, string, error) {
 	input, _, err := fixture.ZesuInputFromZkevmBlock(tc, block)
 	if err != nil {
 		return false, "", "", fmt.Errorf("encode: %w", err)
@@ -238,7 +250,13 @@ func runOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, elfPath, ziske
 
 	// RequireCosts stays false: this tool needs the guest's verdict, not the
 	// cost table, so a run that printed no COST DISTRIBUTION is not an error.
-	r, runErr := emu.Run(emu.Opts{ELF: elfPath, Bin: ziskemuPath}, input)
+	o := emu.Opts{ELF: elfPath, Bin: zkvmPath}
+	if target == "openvm" {
+		// OpenVM prints no UART verdict; RunOpenVM reads it from output byte 32.
+		r, runErr := emu.RunOpenVM(o, input)
+		return runErr == nil && r.ExecErr == "", r.OutputHex, r.RawOut, runErr
+	}
+	r, runErr := emu.Run(o, input)
 	if runErr != nil {
 		return false, r.OutputHex, r.RawOut, runErr
 	}
