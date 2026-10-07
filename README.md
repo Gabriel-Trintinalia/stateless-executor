@@ -108,7 +108,7 @@ go run .
 
 ## Guest contract
 
-- **stdin** — raw SSZ `SszStatelessInput` (schema_id `0x0001`, no framing)
+- **stdin** — raw SSZ `SszStatelessInput` in the tests-zkevm@v21.0.5 layout: a 2-byte schema id (`0x1501` for Amsterdam), then a 16-byte fixed region with no `public_keys`. No framing
 - **stdout** — binary `SszStatelessValidationResult` (byte 32 = `successful_validation`)
 - **stderr** — informational, shown in the `log` field
 
