@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"math/big"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -86,52 +85,9 @@ type rlpBlockBody struct {
 }
 
 func buildBlockRLP(f *FixtureFile, txs types.Transactions, withdrawals []*types.Withdrawal) ([]byte, error) {
-	h := f.StatelessInput.Block.Header
-
-	difficulty, err := hexToBigInt(h.Difficulty)
+	header, err := fixtureHeader(f)
 	if err != nil {
-		return nil, fmt.Errorf("difficulty: %w", err)
-	}
-	baseFee, err := rawJSONToBigInt(h.BaseFeePerGas)
-	if err != nil {
-		return nil, fmt.Errorf("baseFee: %w", err)
-	}
-
-	nonceBytes := mustHexToBytes(h.Nonce)
-	var nonce types.BlockNonce
-	copy(nonce[:], nonceBytes)
-
-	header := &types.Header{
-		ParentHash:    hexToHash(h.ParentHash),
-		UncleHash:     hexToHash(h.OmmersHash),
-		Coinbase:      hexToAddress(h.Beneficiary),
-		Root:          hexToHash(h.StateRoot),
-		TxHash:        hexToHash(h.TransactionsRoot),
-		ReceiptHash:   hexToHash(h.ReceiptsRoot),
-		Bloom:         hexToBloom(h.LogsBloom),
-		Difficulty:    difficulty,
-		Number:        new(big.Int).SetUint64(h.Number),
-		GasLimit:      h.GasLimit,
-		GasUsed:       h.GasUsed,
-		Time:          h.Timestamp,
-		Extra:         mustHexToBytes(h.ExtraData),
-		MixDigest:     hexToHash(h.MixHash),
-		Nonce:         nonce,
-		BaseFee:       baseFee,
-		BlobGasUsed:   h.BlobGasUsed,
-		ExcessBlobGas: h.ExcessBlobGas,
-	}
-	if h.WithdrawalsRoot != nil {
-		wr := hexToHash(*h.WithdrawalsRoot)
-		header.WithdrawalsHash = &wr
-	}
-	if h.ParentBeaconBlockRoot != nil {
-		pbr := hexToHash(*h.ParentBeaconBlockRoot)
-		header.ParentBeaconRoot = &pbr
-	}
-	if h.RequestsHash != nil {
-		rh := hexToHash(*h.RequestsHash)
-		header.RequestsHash = &rh
+		return nil, err
 	}
 
 	return rlp.EncodeToBytes(&rlpBlockBody{

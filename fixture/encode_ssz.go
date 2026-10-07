@@ -1,6 +1,6 @@
 package fixture
 
-// SSZ encoder for SszStatelessInput (glamsterdam-devnet-8 / zkevm@v0.8.0).
+// SSZ encoder for SszStatelessInput (tests-zkevm@v21.0.5).
 //
 // Implements the container layout from stateless_ssz.py, verified field by
 // field against the statelessInputBytes the reference emits in the
@@ -8,19 +8,19 @@ package fixture
 // 32-byte little-endian base_fee_per_gas (zesu reads its low 8 bytes), and a
 // 540-byte SszExecutionPayload fixed region.
 //
-// Stateless input bytes layout (v0.8.0):
+// Stateless input bytes layout (v21.0.1+):
 //   [0..2]    schema_id (big-endian uint16, fixed at 0x1501)
-//   --- SszStatelessInput container (20-byte fixed region) ---
+//   --- SszStatelessInput container (16-byte fixed region) ---
 //   [0..4]    offset → new_payload_request   (variable)
 //   [4..8]    offset → witness               (variable)
 //   [8..16]   chain_id                       (uint64 LE, inline)
-//   [16..20]  offset → public_keys           (variable; packed ByteVector[65])
 //
 // v0.8.0 replaced the nested SszChainConfig — which carried the whole active
 // fork descriptor (fork enum, activation timestamps, blob schedule) — with a
 // bare inline chain_id, growing the fixed region from 16 to 20 bytes. The fork
 // is now pinned by the schema id itself (0x15 = ProtocolFork.Amsterdam, 0x01 =
-// schema revision), so no fork descriptor is encoded at all.
+// schema revision), so no fork descriptor is encoded at all. v21.0.1 dropped
+// the trailing public_keys offset, shrinking the fixed region back to 16 bytes.
 //
 // The payload containers became EIP-7495 ProgressiveContainers and their lists
 // EIP-7916 ProgressiveLists, but those serialize identically to the stable
@@ -121,7 +121,7 @@ func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
 	// Ziskemu requires file payload to be a multiple of 8 bytes (memory alignment).
 	// Write the exact SSZ content length in the framing header so that
 	// read_input_slice() returns only the SSZ bytes — trailing padding zeros would
-	// otherwise land in pubkeys_data and trigger InvalidSsz (first_off == 0).
+	// otherwise be read as part of the witness and trigger InvalidSsz.
 	sszLen := len(payload)
 	for len(payload)%8 != 0 {
 		payload = append(payload, 0)
@@ -139,16 +139,13 @@ func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
 // Layout:
 //
 //	[0..2]   schema_id (big-endian 0x1501) — outside the container
-//	--- SszStatelessInput container (20-byte fixed region) ---
+//	--- SszStatelessInput container (16-byte fixed region) ---
 //	[0..4]   offset → new_payload_request
 //	[4..8]   offset → witness
 //	[8..16]  chain_id (uint64 LE, inline — no longer a nested SszChainConfig)
-//	[16..20] offset → public_keys
-//	[20..]   variable section, in order: npr, witness, public_keys
+//	[16..]   variable section, in order: npr, witness
 //
-// public_keys is SszList[ByteVector[65], MAX_PUBLIC_KEYS] — fixed-size 65-byte
-// elements packed back-to-back. We always emit zero public keys (no pre-
-// recovered signatures on the offline SSZ path) → 0 bytes.
+// tests-zkevm@v21.0.1 removed public_keys (execution-specs #3652).
 func encodeSszStatelessInput(f *FixtureFile, txs types.Transactions, withdrawals []*types.Withdrawal, parentBeaconRoot common.Hash) ([]byte, error) {
 	npr, err := encodeSszNewPayloadRequest(f, txs, withdrawals, parentBeaconRoot)
 	if err != nil {
@@ -171,13 +168,10 @@ func encodeSszStatelessInput(f *FixtureFile, txs types.Transactions, withdrawals
 // SszStatelessInput container around already-encoded sections. Shared by the
 // fixture and live paths so the two can never drift apart.
 func encodeStatelessInputContainer(npr, wit []byte, chainID uint64, schemaID uint16) []byte {
-	var pubKeys []byte // empty packed ByteVector[65] list
-
-	// Fixed region: 4 (offset) + 4 (offset) + 8 (chain_id) + 4 (offset) = 20 bytes.
-	const fixedSize = 20
+	// Fixed region: 4 (offset) + 4 (offset) + 8 (chain_id) = 16 bytes.
+	const fixedSize = 16
 	offNPR := uint32(fixedSize)
 	offWitness := offNPR + uint32(len(npr))
-	offPubKeys := offWitness + uint32(len(wit))
 
 	var out bytes.Buffer
 	// Schema-id prefix (big-endian uint16).
@@ -188,10 +182,8 @@ func encodeStatelessInputContainer(npr, wit []byte, chainID uint64, schemaID uin
 	writeU32LE(&out, offNPR)
 	writeU32LE(&out, offWitness)
 	binary.Write(&out, binary.LittleEndian, chainID)
-	writeU32LE(&out, offPubKeys)
 	out.Write(npr)
 	out.Write(wit)
-	out.Write(pubKeys)
 	return out.Bytes()
 }
 
@@ -220,6 +212,11 @@ func encodeSszNewPayloadRequest(f *FixtureFile, txs types.Transactions, withdraw
 // Fixed region: 540 bytes (see layout in file header comment).
 func encodeSszExecutionPayload(f *FixtureFile, txs types.Transactions, withdrawals []*types.Withdrawal) ([]byte, error) {
 	h := f.StatelessInput.Block.Header
+	header, err := fixtureHeader(f)
+	if err != nil {
+		return nil, err
+	}
+	blockHash := header.Hash()
 
 	extraData := mustHexToBytes(h.ExtraData)
 
@@ -267,7 +264,7 @@ func encodeSszExecutionPayload(f *FixtureFile, txs types.Transactions, withdrawa
 	binary.Write(&fix, binary.LittleEndian, h.Timestamp) // [428..436]
 	writeU32LE(&fix, extraDataOff)                       // [436..440]
 	fix.Write(sszUint256(baseFee))                       // [440..472]
-	fix.Write(make([]byte, 32))                          // [472..504] block_hash (zeros — unused for execution)
+	fix.Write(blockHash[:])                              // [472..504] block_hash
 	writeU32LE(&fix, txsOff)                             // [504..508]
 	writeU32LE(&fix, wdsOff)                             // [508..512]
 	blobGasUsed := uint64(0)

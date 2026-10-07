@@ -88,6 +88,7 @@ func encodeExecutionPayloadFromBlock(block *types.Block, balBytes []byte) ([]byt
 	wdsOff := txsOff + uint32(len(txsSSZ))
 	balOff := wdsOff + uint32(len(wdsSSZ))
 
+	blockHash := block.Hash()
 	var fix bytes.Buffer
 	fix.Write(h.ParentHash[:])                                 // [0..32]
 	fix.Write(h.Coinbase[:])                                   // [32..52]
@@ -101,7 +102,7 @@ func encodeExecutionPayloadFromBlock(block *types.Block, balBytes []byte) ([]byt
 	binary.Write(&fix, binary.LittleEndian, h.Time)            // [428..436]
 	writeU32LE(&fix, extraDataOff)                             // [436..440]
 	fix.Write(sszUint256(baseFee))                             // [440..472]
-	fix.Write(make([]byte, 32))                                // [472..504] block_hash (zeros — unused for execution)
+	fix.Write(blockHash[:])                                    // [472..504] block_hash
 	writeU32LE(&fix, txsOff)                                   // [504..508]
 	writeU32LE(&fix, wdsOff)                                   // [508..512]
 	blobGasUsed := uint64(0)
