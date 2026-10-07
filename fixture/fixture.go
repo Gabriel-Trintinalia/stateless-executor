@@ -269,7 +269,42 @@ type ZkevmTestCase struct {
 	Blocks  []ZkevmBlock `json:"blocks"`
 }
 
-// LoadZkevmFile reads a zkevm blockchain test JSON file and returns all test
+// zkevmEngineCase is a blockchain_test_engine case: each block arrives as an
+// engine payload, carrying the same stateless input and output bytes as a
+// blockchain_test block. params[0] is the execution payload, the source of the
+// block number and gas used.
+type zkevmEngineCase struct {
+	EngineNewPayloads []struct {
+		Params []struct {
+			BlockNumber string `json:"blockNumber"`
+			GasUsed     string `json:"gasUsed"`
+		} `json:"params"`
+		StatelessInputBytes  string `json:"statelessInputBytes"`
+		StatelessOutputBytes string `json:"statelessOutputBytes"`
+		ValidationError      string `json:"validationError"`
+	} `json:"engineNewPayloads"`
+}
+
+// blocks maps the engine payloads onto ZkevmBlock. Transactions stay empty: the
+// payload in params[0] need not list them, and only the report's per-type
+// counts read them.
+func (c *zkevmEngineCase) blocks() []ZkevmBlock {
+	out := make([]ZkevmBlock, len(c.EngineNewPayloads))
+	for i, p := range c.EngineNewPayloads {
+		out[i] = ZkevmBlock{
+			StatelessInputBytes:  p.StatelessInputBytes,
+			StatelessOutputBytes: p.StatelessOutputBytes,
+			ExpectException:      p.ValidationError,
+		}
+		if len(p.Params) > 0 {
+			out[i].BlockHeader = ZkevmHeader{Number: p.Params[0].BlockNumber, GasUsed: p.Params[0].GasUsed}
+		}
+	}
+	return out
+}
+
+// LoadZkevmFile reads a zkevm blockchain test JSON file, in either the
+// blockchain_test or the blockchain_test_engine form, and returns all test
 // cases, ordered by name.
 //
 // The format has one or more top-level keys, each naming a test case. Those keys
@@ -296,6 +331,13 @@ func LoadZkevmFile(path string) ([]*ZkevmTestCase, error) {
 		var tc ZkevmTestCase
 		if err := json.Unmarshal(raw[name], &tc); err != nil {
 			return nil, fmt.Errorf("parse test %q in %s: %w", name, path, err)
+		}
+		if len(tc.Blocks) == 0 {
+			var ec zkevmEngineCase
+			if err := json.Unmarshal(raw[name], &ec); err != nil {
+				return nil, fmt.Errorf("parse test %q in %s: %w", name, path, err)
+			}
+			tc.Blocks = ec.blocks()
 		}
 		tc.Name = name
 		out = append(out, &tc)

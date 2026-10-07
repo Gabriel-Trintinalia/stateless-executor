@@ -12,6 +12,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
 )
 
@@ -48,6 +49,64 @@ func ZesuInputFromZkevmBlock(tc *ZkevmTestCase, block *ZkevmBlock) ([]byte, bool
 	out.Write(lenBuf[:])
 	out.Write(ssz)
 	return out.Bytes(), expectedSuccess, nil
+}
+
+// fixtureHeader rebuilds the block header a fixture describes, so its hash is
+// the block's hash. The block access list hash is keccak256 of the BAL bytes,
+// which is how the header commits to them (EIP-7928).
+func fixtureHeader(f *FixtureFile) (*types.Header, error) {
+	h := f.StatelessInput.Block.Header
+
+	difficulty, err := hexToBigInt(h.Difficulty)
+	if err != nil {
+		return nil, fmt.Errorf("difficulty: %w", err)
+	}
+	baseFee, err := rawJSONToBigInt(h.BaseFeePerGas)
+	if err != nil {
+		return nil, fmt.Errorf("baseFee: %w", err)
+	}
+
+	var nonce types.BlockNonce
+	copy(nonce[:], mustHexToBytes(h.Nonce))
+
+	header := &types.Header{
+		ParentHash:    hexToHash(h.ParentHash),
+		UncleHash:     hexToHash(h.OmmersHash),
+		Coinbase:      hexToAddress(h.Beneficiary),
+		Root:          hexToHash(h.StateRoot),
+		TxHash:        hexToHash(h.TransactionsRoot),
+		ReceiptHash:   hexToHash(h.ReceiptsRoot),
+		Bloom:         hexToBloom(h.LogsBloom),
+		Difficulty:    difficulty,
+		Number:        new(big.Int).SetUint64(h.Number),
+		GasLimit:      h.GasLimit,
+		GasUsed:       h.GasUsed,
+		Time:          h.Timestamp,
+		Extra:         mustHexToBytes(h.ExtraData),
+		MixDigest:     hexToHash(h.MixHash),
+		Nonce:         nonce,
+		BaseFee:       baseFee,
+		BlobGasUsed:   h.BlobGasUsed,
+		ExcessBlobGas: h.ExcessBlobGas,
+		SlotNumber:    h.SlotNumber,
+	}
+	if h.WithdrawalsRoot != nil {
+		wr := hexToHash(*h.WithdrawalsRoot)
+		header.WithdrawalsHash = &wr
+	}
+	if h.ParentBeaconBlockRoot != nil {
+		pbr := hexToHash(*h.ParentBeaconBlockRoot)
+		header.ParentBeaconRoot = &pbr
+	}
+	if h.RequestsHash != nil {
+		rh := hexToHash(*h.RequestsHash)
+		header.RequestsHash = &rh
+	}
+	if bal := f.StatelessInput.Block.Body.BlockAccessList; bal != nil {
+		balHash := crypto.Keccak256Hash(mustHexToBytes(*bal))
+		header.BlockAccessListHash = &balHash
+	}
+	return header, nil
 }
 
 func buildTransactions(txs []FixtureTx) (types.Transactions, error) {

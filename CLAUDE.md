@@ -28,20 +28,25 @@ works for both:
   (500 mainnet blocks, Q1 2026, 5.8 GB).
 - **zkevm** — EEST `blockchain_tests` trees, where one file holds many named test
   cases of one or more blocks each, carrying a pre-encoded `statelessInputBytes`.
-  The benchmark set (`fixtures_benchmark/blockchain_tests/for_amsterdam_at_{0010M,0030M,0060M}`)
-  is 339 files / 3.7 GB / 7,390 blocks, and stresses individual opcodes at fixed
-  gas — the sharpest signal available for guest cost per gas.
+  `blockchain_tests_engine` trees (`engineNewPayloads` instead of `blocks`), such
+  as the R2 Sepolia corpus, are read the same way; their payloads carry only
+  the block number and gas used, so the transaction-type columns stay 0.
+  The benchmark set ([`tests-zkevm-benchmark@v21.0.5`](https://github.com/ethereum/execution-specs/releases/tag/tests-zkevm-benchmark%40v21.0.5))
+  ships one tarball per gas tier — 30M, 60M, 100M, 150M and 200M, 156 MB to
+  903 MB compressed — each extracting to `fixtures/blockchain_tests/for_amsterdam_at_<tier>`
+  (30M: 121 files, 1,203 blocks). It stresses individual opcodes at fixed gas —
+  the sharpest signal available for guest cost per gas.
 
 Discovery recurses and prunes dot-directories, so pointing `--fixtures` at a
 spec-tests tree does not trip over its 166 MB `.meta/index.json`.
 
 ```bash
 # Census only: what would run, per format and per suite. No emulator, seconds.
-go run ./bench --fixtures ~/Downloads/fixtures_benchmark --dry-run
+go run ./bench --fixtures ~/Downloads/fixtures --dry-run
 
 # Cost-measure the 60M-gas benchmark fixtures.
 go run ./bench \
-  --fixtures ~/Downloads/fixtures_benchmark/blockchain_tests/for_amsterdam_at_0060M \
+  --fixtures ~/Downloads/fixtures/blockchain_tests/for_amsterdam_at_0060M \
   --elf ~/Development/eth-proofs/zesu-zkvm/zisk/zig-out/bin/zesu-zisk \
   --jobs 8 --report bench_60M.html --csv bench_60M.csv
 ```
