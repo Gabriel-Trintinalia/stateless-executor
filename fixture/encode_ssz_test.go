@@ -3,6 +3,8 @@ package fixture
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
+	"os"
 	"testing"
 )
 
@@ -65,7 +67,11 @@ func TestExecutionRequestsMatchesReference(t *testing.T) {
 		0x14, 0x00, 0x00, 0x00,
 		0x14, 0x00, 0x00, 0x00,
 	}
-	if got := encodeSszExecutionRequests(); !bytes.Equal(got, want) {
+	got, err := encodeSszExecutionRequests(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
 		t.Errorf("execution requests mismatch\ngot:  %x\nwant: %x", got, want)
 	}
 }
@@ -97,5 +103,48 @@ func TestContainerSectionsAreContiguous(t *testing.T) {
 	}
 	if !bytes.Equal(body[offWit:], wit) {
 		t.Error("witness section does not match its offsets")
+	}
+}
+
+// TestExecutionRequestsMatchesReferenceRequests encodes the Engine API request
+// list of a tests-zkevm@v21.0.5 payload carrying all five request types, and
+// compares it with the execution_requests section the reference serializer put
+// in that payload's statelessInputBytes.
+func TestExecutionRequestsMatchesReferenceRequests(t *testing.T) {
+	data, err := os.ReadFile("testdata/execution_requests_v21.0.5.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vector struct {
+		ExecutionRequests    []string `json:"executionRequests"`
+		SszExecutionRequests string   `json:"sszExecutionRequests"`
+	}
+	if err := json.Unmarshal(data, &vector); err != nil {
+		t.Fatal(err)
+	}
+	requests := make([][]byte, len(vector.ExecutionRequests))
+	for i, r := range vector.ExecutionRequests {
+		requests[i] = mustHexToBytes(r)
+	}
+
+	got, err := encodeSszExecutionRequests(requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := mustHexToBytes(vector.SszExecutionRequests); !bytes.Equal(got, want) {
+		t.Errorf("execution requests mismatch\ngot:  %x\nwant: %x", got, want)
+	}
+}
+
+func TestExecutionRequestsRejectsMalformedLists(t *testing.T) {
+	for name, requests := range map[string][][]byte{
+		"unknown type": {{0x05, 0xaa}},
+		"out of order": {{0x02, 0xaa}, {0x01, 0xbb}},
+		"duplicate":    {{0x00, 0xaa}, {0x00, 0xbb}},
+		"no data":      {{0x00}},
+	} {
+		if _, err := encodeSszExecutionRequests(requests); err == nil {
+			t.Errorf("%s: want an error", name)
+		}
 	}
 }

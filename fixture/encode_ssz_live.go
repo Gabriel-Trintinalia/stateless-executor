@@ -13,20 +13,22 @@ import (
 // block is decoded from debug_getRawBlock RLP; state, codes, headers are
 // already-decoded witness byte arrays from debug_executionWitness.
 // balBytes is the RLP-encoded BlockAccessList (nil for pre-Amsterdam).
+// requests are the block's execution requests in the Engine API form
+// (request_type ++ request_data per non-empty type); nil for none.
 // chainID is inlined into SszStatelessInput (v0.8.0); 0 falls back to mainnet (1).
 // fork is the ProtocolFork index the block must be executed under, stamped into
 // the schema id; 0 falls back to Amsterdam.
-func ZesuInputSSZFromBlock(block *types.Block, state, codes, headers [][]byte, balBytes []byte, chainID uint64, fork uint8) ([]byte, error) {
+func ZesuInputSSZFromBlock(block *types.Block, state, codes, headers [][]byte, balBytes []byte, requests [][]byte, chainID uint64, fork uint8) ([]byte, error) {
 	var parentBeaconRoot common.Hash
 	if r := block.BeaconRoot(); r != nil {
 		parentBeaconRoot = *r
 	}
 
-	return encodeStatelessInputFromBlock(block, state, codes, headers, parentBeaconRoot, balBytes, chainID, fork)
+	return encodeStatelessInputFromBlock(block, state, codes, headers, parentBeaconRoot, balBytes, requests, chainID, fork)
 }
 
-func encodeStatelessInputFromBlock(block *types.Block, state, codes, headers [][]byte, parentBeaconRoot common.Hash, balBytes []byte, chainID uint64, fork uint8) ([]byte, error) {
-	npr, err := encodeNewPayloadRequestFromBlock(block, parentBeaconRoot, balBytes)
+func encodeStatelessInputFromBlock(block *types.Block, state, codes, headers [][]byte, parentBeaconRoot common.Hash, balBytes []byte, requests [][]byte, chainID uint64, fork uint8) ([]byte, error) {
+	npr, err := encodeNewPayloadRequestFromBlock(block, parentBeaconRoot, balBytes, requests)
 	if err != nil {
 		return nil, err
 	}
@@ -41,13 +43,16 @@ func encodeStatelessInputFromBlock(block *types.Block, state, codes, headers [][
 	return encodeStatelessInputContainer(npr, wit, chainID, schemaIDFor(fork)), nil
 }
 
-func encodeNewPayloadRequestFromBlock(block *types.Block, parentBeaconRoot common.Hash, balBytes []byte) ([]byte, error) {
+func encodeNewPayloadRequestFromBlock(block *types.Block, parentBeaconRoot common.Hash, balBytes []byte, requests [][]byte) ([]byte, error) {
 	ep, err := encodeExecutionPayloadFromBlock(block, balBytes)
 	if err != nil {
 		return nil, err
 	}
 	vh := encodeSszVersionedHashes(block.Transactions())
-	er := encodeSszExecutionRequests()
+	er, err := encodeSszExecutionRequests(requests)
+	if err != nil {
+		return nil, err
+	}
 
 	// Fixed: 4 (ep offset) + 4 (vh offset) + 32 (parent_beacon_block_root) + 4 (er offset) = 44
 	const fixedSize = 44

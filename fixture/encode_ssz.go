@@ -32,6 +32,7 @@ package fixture
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -195,7 +196,10 @@ func encodeSszNewPayloadRequest(f *FixtureFile, txs types.Transactions, withdraw
 		return nil, err
 	}
 	vh := encodeSszVersionedHashes(txs)
-	er := encodeSszExecutionRequests() // empty for pre-Prague blocks
+	er, err := encodeSszExecutionRequests(nil) // fixture files carry no requests
+	if err != nil {
+		return nil, err
+	}
 
 	// Fixed: 4 (ep offset) + 4 (vh offset) + 32 (parent_beacon_block_root) + 4 (er offset) = 44
 	const fixedSize = 44
@@ -373,15 +377,38 @@ func encodeSszVersionedHashes(txs types.Transactions) []byte {
 // to 5 by appending builder_deposits and builder_exits.
 const executionRequestTypes = 5
 
-// encodeSszExecutionRequests encodes an empty SszExecutionRequests container:
-// fixed region = 4 bytes per variable field, every offset pointing just past it.
-func encodeSszExecutionRequests() []byte {
+// encodeSszExecutionRequests encodes the SszExecutionRequests container from
+// requests in the Engine API form: request_type ++ request_data, one entry per
+// non-empty type, in ascending type order. Every request type has fixed-size
+// items, so a type's request_data is already its list's SSZ encoding; the
+// container is one offset per type followed by the lists. nil encodes the empty
+// container.
+func encodeSszExecutionRequests(requests [][]byte) ([]byte, error) {
+	var lists [executionRequestTypes][]byte
+	last := -1
+	for _, r := range requests {
+		if len(r) < 2 {
+			return nil, fmt.Errorf("execution request of %d bytes", len(r))
+		}
+		t := int(r[0])
+		if t >= executionRequestTypes || t <= last {
+			return nil, fmt.Errorf("execution request type 0x%02x out of range or order", r[0])
+		}
+		last = t
+		lists[t] = r[1:]
+	}
+
 	const fixedSize = 4 * executionRequestTypes
 	var buf bytes.Buffer
-	for i := 0; i < executionRequestTypes; i++ {
-		writeU32LE(&buf, fixedSize)
+	off := fixedSize
+	for _, l := range lists {
+		writeU32LE(&buf, uint32(off))
+		off += len(l)
 	}
-	return buf.Bytes()
+	for _, l := range lists {
+		buf.Write(l)
+	}
+	return buf.Bytes(), nil
 }
 
 // ── SSZ primitive helpers ─────────────────────────────────────────────────────

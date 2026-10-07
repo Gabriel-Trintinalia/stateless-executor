@@ -12,7 +12,7 @@ This repo contains two largely independent halves:
 ### Prerequisites
 
 - Go 1.24+
-- A running Ethereum EL node that supports `debug_getRawBlock`, `debug_executionWitness`, `eth_getBlockAccessList`, and `engine_getPayloadBodiesByHashV2`
+- A running Ethereum EL node that supports `debug_getRawBlock`, `debug_executionWitness`, `eth_getBlockAccessList`, and `engine_getPayloadBodiesByHashV2`, plus `debug_getRawExecutionRequests` (Besu) for blocks that carry execution requests
 - The `zesu` guest binary (built from the [zesu repo](https://github.com/Gabriel-Trintinalia/zesu))
 - The network's `genesis.json`
 - The engine API JWT secret
