@@ -140,6 +140,58 @@ func Run(o Opts, input []byte) (Result, error) {
 	return r, nil
 }
 
+// RunOpenVM is the OpenVM equivalent of Run, driving zesu-openvm-runner.
+// OpenVM emulation produces no circuit cost breakdown, so a missing cost table
+// is never an error here, and the guest's verdict is read from the output
+// region (byte 32, successful_validation) rather than from an "execution
+// failed" line: ExecErr is set to "ExecutionFailed" when that byte is zero.
+func RunOpenVM(o Opts, input []byte) (Result, error) {
+	var r Result
+
+	inFile, err := os.CreateTemp("", "zesu-openvm-in-*.bin")
+	if err != nil {
+		return r, err
+	}
+	defer os.Remove(inFile.Name())
+	if _, err := inFile.Write(input); err != nil {
+		inFile.Close()
+		return r, err
+	}
+	if err := inFile.Close(); err != nil {
+		return r, err
+	}
+
+	outFile, err := os.CreateTemp("", "zesu-openvm-out-*.bin")
+	if err != nil {
+		return r, err
+	}
+	outPath := outFile.Name()
+	outFile.Close()
+	defer os.Remove(outPath)
+
+	out, runErr := exec.Command(o.Bin, "-X", "-e", o.ELF, "-i", inFile.Name(), "-o", outPath).
+		CombinedOutput()
+	r.RawOut = strings.TrimSpace(string(out))
+	if runErr != nil {
+		return r, fmt.Errorf("runner: %w", runErr)
+	}
+
+	outBytes, err := os.ReadFile(outPath)
+	if err != nil {
+		return r, fmt.Errorf("read output: %w", err)
+	}
+	if len(outBytes) < StatelessOutputSize {
+		return r, fmt.Errorf("output too short: %d bytes (expected %d)", len(outBytes), StatelessOutputSize)
+	}
+	r.OutputHex = hex.EncodeToString(outBytes)
+
+	if outBytes[32] == 0 {
+		r.ExecErr = "ExecutionFailed"
+	}
+	r.Costs, _ = ParseCostReport(r.RawOut)
+	return r, nil
+}
+
 func allZero(b []byte) bool {
 	for _, c := range b {
 		if c != 0 {
