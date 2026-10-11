@@ -87,6 +87,26 @@ func ParseGenesisFile(path string) (*GenesisChainConfig, error) {
 	return cfg, nil
 }
 
+// DefaultMainnetChainConfig returns the mainnet chain config to fall back to
+// when no GENESIS_FILE is supplied. Activation timestamps are mirrored from
+// zesu's own mainnet schedule (src/stateless/hardfork.zig mainnetSpec) — the
+// guest's single source of truth for which fork is live at a given block
+// time. Amsterdam has no timestamp there yet (mainnet is currently on BPO2),
+// so it's omitted here too; add it once zesu pins it, so this stays in
+// lockstep with the guest instead of guessing ahead of it.
+func DefaultMainnetChainConfig() *GenesisChainConfig {
+	return &GenesisChainConfig{
+		ChainID: 1,
+		activeForks: []genesisFork{
+			{enumVal: forkCancun, activationTime: 1710338135},
+			{enumVal: forkPrague, activationTime: 1746612311},
+			{enumVal: forkOsaka, activationTime: 1764798551},
+			{enumVal: forkBPO1, activationTime: 1765290071},
+			{enumVal: forkBPO2, activationTime: 1767747671},
+		},
+	}
+}
+
 // ForkCount returns the number of forks parsed from genesis.
 func (g *GenesisChainConfig) ForkCount() int { return len(g.activeForks) }
 

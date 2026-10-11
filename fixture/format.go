@@ -18,7 +18,8 @@ const (
 	FormatCorpus
 	// FormatZkevm is the EEST blockchain_test schema read by LoadZkevmFile:
 	// a map of test-case name to a case holding "blocks", each block carrying
-	// "statelessInputBytes".
+	// "statelessInputBytes". The blockchain_test_engine variant, with
+	// "engineNewPayloads" in place of "blocks", is read the same way.
 	FormatZkevm
 )
 
@@ -47,6 +48,7 @@ var formatMarkers = []struct {
 }{
 	{[]byte(`"stateless_input"`), FormatCorpus},
 	{[]byte(`"genesisBlockHeader"`), FormatZkevm},
+	{[]byte(`"engineNewPayloads"`), FormatZkevm},
 	{[]byte(`"statelessInputBytes"`), FormatZkevm},
 	{[]byte(`"blocks"`), FormatZkevm},
 }

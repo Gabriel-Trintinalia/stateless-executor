@@ -30,6 +30,11 @@ func TestSniffFormat(t *testing.T) {
 			want:    FormatZkevm,
 		},
 		{
+			name:    "zkevm engine via engineNewPayloads",
+			content: `{"some::case":{"network":"Amsterdam","engineNewPayloads":[{"params":[{"blockNumber":"0x1"}]}]}}`,
+			want:    FormatZkevm,
+		},
+		{
 			name:    "meta index is not a fixture",
 			content: `{"root_hash":"0x6496","created_at":"2026-08-19T11:03:54Z","test_count":335273,"forks":["Amsterdam"]}`,
 			want:    FormatUnknown,

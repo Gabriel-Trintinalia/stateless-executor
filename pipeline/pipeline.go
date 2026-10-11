@@ -174,6 +174,11 @@ func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64, genesis *fixture.
 	}
 	meta.BALBytes = len(balBytes)
 
+	requests, err := fetchRequests(ctx, p, rawURL, blockNum, hexNum, block)
+	if err != nil {
+		return nil, elNode, meta, fmt.Errorf("pipeline: execution requests(%d): %w", blockNum, err)
+	}
+
 	if verbose {
 		log.Printf("block #%d [%s]: witness state=%d codes=%d keys=%d headers=%d (raw=%s)",
 			blockNum, elNode, len(w.State), len(w.Codes), len(w.Keys), len(headers), w.Headers)
@@ -190,7 +195,7 @@ func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64, genesis *fixture.
 		fork = genesis.ActiveProtocolFork(block.Time())
 	}
 
-	encoded, err := fixture.ZesuInputSSZFromBlock(block, state, codes, headers, balBytes, chainID, fork)
+	encoded, err := fixture.ZesuInputSSZFromBlock(block, state, codes, headers, balBytes, requests, chainID, fork)
 	return encoded, elNode, meta, err
 }
 
@@ -306,6 +311,39 @@ func fetchBALFromEngine(ctx context.Context, engineURL, jwtSecretFile string, bl
 		return nil, nil
 	}
 	return hexToBytes(result.Result[0].BlockAccessList)
+}
+
+// fetchRequests returns the block's execution requests in the Engine API form
+// (request_type ++ request_data per non-empty type). They are not part of the
+// block body, so the EL re-executes the block to produce them
+// (debug_getRawExecutionRequests, Besu). Unlike the BAL, a set that does not
+// hash to the header's requests_hash is an error: the guest rejects the input
+// with an invalid block hash anyway, so the block fails here, with the cause.
+func fetchRequests(ctx context.Context, p *pool.Pool, rawURL string, blockNum uint64, hexNum string, block *types.Block) ([][]byte, error) {
+	want := block.Header().RequestsHash
+	if want == nil || *want == types.EmptyRequestsHash {
+		return nil, nil
+	}
+	log.Printf("block #%d: fetching execution requests", blockNum)
+	raw, err := p.CallRaw(ctx, rawURL, "debug_getRawExecutionRequests", []interface{}{hexNum})
+	if err != nil {
+		return nil, err
+	}
+	var encoded []string
+	if err := json.Unmarshal(raw, &encoded); err != nil {
+		return nil, fmt.Errorf("decoding debug_getRawExecutionRequests: %w", err)
+	}
+	requests := make([][]byte, len(encoded))
+	for i, e := range encoded {
+		if requests[i], err = hexToBytes(e); err != nil {
+			return nil, fmt.Errorf("request %d: %w", i, err)
+		}
+	}
+	if got := types.CalcRequestsHash(requests); got != *want {
+		return nil, fmt.Errorf("requests hash %s does not match header %s", got.Hex(), want.Hex())
+	}
+	log.Printf("block #%d: requests hash OK (%s)", blockNum, want.Hex()[:10])
+	return requests, nil
 }
 
 // fetchBAL calls eth_getBlockAccessList, parses the response into a

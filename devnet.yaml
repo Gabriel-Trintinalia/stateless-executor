@@ -1,12 +1,12 @@
 participants_matrix:
   el:
-    # glamsterdam-devnet-8-zkevm build — the only EL in the matrix, so every
-    # node the executor tracks serves zkEVM-flavoured stateless data.
+    # The only EL in the matrix, so every node the executor tracks serves
+    # zkEVM-flavoured stateless data (incl. debug_getRawExecutionRequests).
     - el_type: besu
-      el_image: hyperledger/besu:26.8-develop-d1779ae
+      el_image: hyperledger/besu:26.10-develop-591429c
   cl:
     - cl_type: lodestar
-      cl_image: ethpandaops/lodestar:glamsterdam-devnet-8
+      cl_image: ethpandaops/lodestar:unstable  # glamsterdam-devnet-11
 
 network_params:
   preset: minimal
