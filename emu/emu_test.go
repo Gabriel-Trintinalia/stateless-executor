@@ -97,6 +97,30 @@ public values: 43 bytes`
 	}
 }
 
+// zesu-sp1-runner's -X report: INSTRUCTIONS is read; GAS, the opcode mix and
+// the syscall table must not land in any other field.
+func TestParseCostReportSP1(t *testing.T) {
+	out := `REPORT
+===================================================================================
+INSTRUCTIONS                                                  680,446,538
+THROUGHPUT                                                       75.1 M/s
+GAS                                                           603,661,663
+SYSCALLS                                                          147,006
+
+INSTRUCTION MIX                                                     COUNT         %
+-----------------------------------------------------------------------------------
+ADDI                                                           64,438,885    19.37%
+
+SYSCALL                                                             COUNT         %
+-----------------------------------------------------------------------------------
+KECCAK_PERMUTE                                                     92,427    13.07%
+public values: 43 bytes`
+	got, _ := ParseCostReport(out)
+	if want := (CostReport{Instructions: 680446538}); got != want {
+		t.Errorf("ParseCostReport =\n  %+v\nwant\n  %+v", got, want)
+	}
+}
+
 func TestEffectiveMaxSteps(t *testing.T) {
 	if got := (Opts{}).EffectiveMaxSteps(); got != DefaultZiskMaxSteps {
 		t.Errorf("MaxSteps 0: effective = %d, want the emulator default %d", got, DefaultZiskMaxSteps)
