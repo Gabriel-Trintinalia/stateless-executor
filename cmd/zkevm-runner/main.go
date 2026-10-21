@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	zkevm-runner --fixtures <dir> --elf <path> [--target zisk|openvm] [--zkvmPath <path>] [--jobs N]
+//	zkevm-runner --fixtures <dir> --elf <path> [--target zisk|openvm|pico] [--zkvmPath <path>] [--jobs N]
 package main
 
 import (
@@ -42,8 +42,8 @@ type TestResult struct {
 func main() {
 	fixturesDir := flag.String("fixtures", "", "directory containing zkevm blockchain test JSON files (required)")
 	elfPath := flag.String("elf", "", "path to the zesu-zkvm ELF binary (required unless -dump-dir is set)")
-	targetFlag := flag.String("target", "zisk", "zkVM target: zisk or openvm")
-	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM)")
+	targetFlag := flag.String("target", "zisk", "zkVM target: zisk, openvm or pico")
+	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM, zesu-pico-runner for Pico)")
 	ziskemuPath := flag.String("ziskemu", "ziskemu", "path to ziskemu binary; superseded by --zkvmPath")
 	jobs := flag.Int("jobs", 1, "number of parallel emulator runs")
 	reportPath := flag.String("report", "", "output HTML report path (omit to skip)")
@@ -54,15 +54,16 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	if *targetFlag != "zisk" && *targetFlag != "openvm" {
-		log.Fatalf("unknown target %q: must be zisk or openvm", *targetFlag)
+	defaultZkvm := map[string]string{
+		"zisk":   *ziskemuPath,
+		"openvm": "zesu-openvm-runner",
+		"pico":   "zesu-pico-runner",
+	}
+	if _, ok := defaultZkvm[*targetFlag]; !ok {
+		log.Fatalf("unknown target %q: must be zisk, openvm or pico", *targetFlag)
 	}
 	if *zkvmPath == "" {
-		if *targetFlag == "openvm" {
-			*zkvmPath = "zesu-openvm-runner"
-		} else {
-			*zkvmPath = *ziskemuPath
-		}
+		*zkvmPath = defaultZkvm[*targetFlag]
 	}
 	if *dumpDir == "" && *elfPath == "" {
 		log.Fatalf("-elf is required when -dump-dir is not set")
@@ -251,9 +252,13 @@ func runOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, elfPath, zkvmP
 	// RequireCosts stays false: this tool needs the guest's verdict, not the
 	// cost table, so a run that printed no COST DISTRIBUTION is not an error.
 	o := emu.Opts{ELF: elfPath, Bin: zkvmPath}
-	if target == "openvm" {
-		// OpenVM prints no UART verdict; RunOpenVM reads it from output byte 32.
-		r, runErr := emu.RunOpenVM(o, input)
+	if target == "openvm" || target == "pico" {
+		// These runners print no UART verdict; it is read from output byte 32.
+		run := emu.RunOpenVM
+		if target == "pico" {
+			run = emu.RunPico
+		}
+		r, runErr := run(o, input)
 		return runErr == nil && r.ExecErr == "", r.OutputHex, r.RawOut, runErr
 	}
 	r, runErr := emu.Run(o, input)
