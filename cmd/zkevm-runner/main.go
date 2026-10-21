@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	zkevm-runner --fixtures <dir> --elf <path> [--target zisk|openvm|pico] [--zkvmPath <path>] [--jobs N]
+//	zkevm-runner --fixtures <dir> --elf <path> [--target zisk|openvm|pico|sp1] [--zkvmPath <path>] [--jobs N]
 package main
 
 import (
@@ -42,8 +42,8 @@ type TestResult struct {
 func main() {
 	fixturesDir := flag.String("fixtures", "", "directory containing zkevm blockchain test JSON files (required)")
 	elfPath := flag.String("elf", "", "path to the zesu-zkvm ELF binary (required unless -dump-dir is set)")
-	targetFlag := flag.String("target", "zisk", "zkVM target: zisk, openvm or pico")
-	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM, zesu-pico-runner for Pico)")
+	targetFlag := flag.String("target", "zisk", "zkVM target: zisk, openvm, pico or sp1")
+	zkvmPath := flag.String("zkvmPath", "", "path to zkVM emulator binary (ziskemu for ZisK, zesu-openvm-runner for OpenVM, zesu-pico-runner for Pico, zesu-sp1-runner for SP1)")
 	ziskemuPath := flag.String("ziskemu", "ziskemu", "path to ziskemu binary; superseded by --zkvmPath")
 	jobs := flag.Int("jobs", 1, "number of parallel emulator runs")
 	reportPath := flag.String("report", "", "output HTML report path (omit to skip)")
@@ -58,9 +58,10 @@ func main() {
 		"zisk":   *ziskemuPath,
 		"openvm": "zesu-openvm-runner",
 		"pico":   "zesu-pico-runner",
+		"sp1":    "zesu-sp1-runner",
 	}
 	if _, ok := defaultZkvm[*targetFlag]; !ok {
-		log.Fatalf("unknown target %q: must be zisk, openvm or pico", *targetFlag)
+		log.Fatalf("unknown target %q: must be zisk, openvm, pico or sp1", *targetFlag)
 	}
 	if *zkvmPath == "" {
 		*zkvmPath = defaultZkvm[*targetFlag]
@@ -252,11 +253,13 @@ func runOne(tc *fixture.ZkevmTestCase, block *fixture.ZkevmBlock, elfPath, zkvmP
 	// RequireCosts stays false: this tool needs the guest's verdict, not the
 	// cost table, so a run that printed no COST DISTRIBUTION is not an error.
 	o := emu.Opts{ELF: elfPath, Bin: zkvmPath}
-	if target == "openvm" || target == "pico" {
+	if target == "openvm" || target == "pico" || target == "sp1" {
 		// These runners print no UART verdict; it is read from output byte 32.
 		run := emu.RunOpenVM
 		if target == "pico" {
 			run = emu.RunPico
+		} else if target == "sp1" {
+			run = emu.RunSP1
 		}
 		r, runErr := run(o, input)
 		return runErr == nil && r.ExecErr == "", r.OutputHex, r.RawOut, runErr

@@ -154,6 +154,9 @@ func RunOpenVM(o Opts, input []byte) (Result, error) { return runHost(o, input, 
 // CostReport.Cycles; the verdict is read from output byte 32 as for OpenVM.
 func RunPico(o Opts, input []byte) (Result, error) { return runHost(o, input, "pico") }
 
+// RunSP1 is the SP1 equivalent of RunOpenVM, driving zesu-sp1-runner.
+func RunSP1(o Opts, input []byte) (Result, error) { return runHost(o, input, "sp1") }
+
 // runHost runs a zesu-zkvm host runner (OpenVM, Pico) that takes ziskemu's
 // -X -e -i -o command line and writes the guest's public values to -o.
 func runHost(o Opts, input []byte, name string) (Result, error) {
