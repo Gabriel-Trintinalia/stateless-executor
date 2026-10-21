@@ -26,6 +26,7 @@ const StatelessOutputSize = 43
 // CostReport holds the parsed COST DISTRIBUTION table for one run.
 // ZisK populates Base/Main/Opcodes/Precompiles/Memory/Total (circuit trace
 // cells). OpenVM populates Instructions/Total (retired instruction count).
+// Pico populates Cycles.
 type CostReport struct {
 	Base         uint64
 	Main         uint64
@@ -34,6 +35,7 @@ type CostReport struct {
 	Memory       uint64
 	Total        uint64
 	Instructions uint64 // OpenVM: retired instruction count (deterministic)
+	Cycles       uint64 // Pico: executed cycles (deterministic)
 	Steps        uint64 // ZisK: emulated steps; compared against the step cap
 }
 
@@ -145,10 +147,19 @@ func Run(o Opts, input []byte) (Result, error) {
 // is never an error here, and the guest's verdict is read from the output
 // region (byte 32, successful_validation) rather than from an "execution
 // failed" line: ExecErr is set to "ExecutionFailed" when that byte is zero.
-func RunOpenVM(o Opts, input []byte) (Result, error) {
+func RunOpenVM(o Opts, input []byte) (Result, error) { return runHost(o, input, "openvm") }
+
+// RunPico is the Pico (Brevis) equivalent of RunOpenVM, driving
+// zesu-pico-runner. Its -X report carries a CYCLES line, parsed into
+// CostReport.Cycles; the verdict is read from output byte 32 as for OpenVM.
+func RunPico(o Opts, input []byte) (Result, error) { return runHost(o, input, "pico") }
+
+// runHost runs a zesu-zkvm host runner (OpenVM, Pico) that takes ziskemu's
+// -X -e -i -o command line and writes the guest's public values to -o.
+func runHost(o Opts, input []byte, name string) (Result, error) {
 	var r Result
 
-	inFile, err := os.CreateTemp("", "zesu-openvm-in-*.bin")
+	inFile, err := os.CreateTemp("", "zesu-"+name+"-in-*.bin")
 	if err != nil {
 		return r, err
 	}
@@ -161,7 +172,7 @@ func RunOpenVM(o Opts, input []byte) (Result, error) {
 		return r, err
 	}
 
-	outFile, err := os.CreateTemp("", "zesu-openvm-out-*.bin")
+	outFile, err := os.CreateTemp("", "zesu-"+name+"-out-*.bin")
 	if err != nil {
 		return r, err
 	}
@@ -232,7 +243,7 @@ func ParseExecError(output string) string {
 
 // ParseCostReport parses a COST DISTRIBUTION table from combined emulator
 // output. Handles both the ZisK table (BASE/MAIN/OPCODES/PRECOMPILES/MEMORY/
-// TOTAL) and the OpenVM one (INSTRUCTIONS/TOTAL).
+// TOTAL) and the OpenVM one (INSTRUCTIONS/TOTAL), plus Pico's CYCLES line.
 //
 // The bool reports whether a cost table was found at all.
 func ParseCostReport(output string) (CostReport, bool) {
@@ -256,6 +267,8 @@ func ParseCostReport(output string) (CostReport, bool) {
 		} else if v, ok := ParseCostLine(line, "INSTRUCTIONS"); ok {
 			r.Instructions = v
 			found = true
+		} else if v, ok := ParseCostLine(line, "CYCLES"); ok {
+			r.Cycles = v
 		} else if v, ok := ParseCostLine(line, "STEPS"); ok {
 			// Deliberately does not set `found`: STEPS sits in the REPORT header
 			// above the cost table, so letting it satisfy `found` would mask a

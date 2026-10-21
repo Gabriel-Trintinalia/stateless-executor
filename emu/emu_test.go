@@ -76,6 +76,27 @@ func TestParseCostReportIgnoresStepsHeaders(t *testing.T) {
 	}
 }
 
+// zesu-pico-runner's -X report: CYCLES is read; THROUGHPUT and the syscall
+// table must not land in any other field.
+func TestParseCostReportPico(t *testing.T) {
+	out := `execute: 1.21s, 899,123,456 cycles
+
+REPORT
+==================================================================================
+CYCLES                                                        899,123,456
+THROUGHPUT                                                     742.1 M/s
+SYSCALLS                                                           12,345
+
+SYSCALL                                                             COUNT         %
+----------------------------------------------------------------------------------
+KECCAK_PERMUTE                                                     10,000    81.00%
+public values: 43 bytes`
+	got, _ := ParseCostReport(out)
+	if want := (CostReport{Cycles: 899123456}); got != want {
+		t.Errorf("ParseCostReport =\n  %+v\nwant\n  %+v", got, want)
+	}
+}
+
 func TestEffectiveMaxSteps(t *testing.T) {
 	if got := (Opts{}).EffectiveMaxSteps(); got != DefaultZiskMaxSteps {
 		t.Errorf("MaxSteps 0: effective = %d, want the emulator default %d", got, DefaultZiskMaxSteps)

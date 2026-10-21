@@ -146,7 +146,7 @@ bench --fixtures <dir> --elf <path> [--target zisk|openvm] [--jobs N] [--report 
 ### `zkevm-runner` — zkevm spec-test fixtures
 
 ```
-zkevm-runner --fixtures <dir> --elf <path> [--jobs N] [--report <path>]
+zkevm-runner --fixtures <dir> --elf <path> [--target zisk|openvm|pico] [--zkvmPath <path>] [--jobs N] [--report <path>]
 ```
 
 ## Project structure
