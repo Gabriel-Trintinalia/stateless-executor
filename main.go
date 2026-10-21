@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,7 +75,13 @@ func main() {
 		if err != nil {
 			log.Fatalf("BLOCK_NUMBER: %v", err)
 		}
+		if dir := os.Getenv("DUMP_DIR"); dir != "" {
+			os.Exit(dumpBlock(ctx, p, genesis, blockNum, verbose, engineURL, jwtSecretFile, dir))
+		}
 		os.Exit(runBlock(ctx, p, genesis, guests, blockNum, verbose, engineURL, jwtSecretFile))
+	}
+	if os.Getenv("DUMP_DIR") != "" {
+		log.Fatal("DUMP_DIR requires BLOCK_NUMBER")
 	}
 
 	// ── Live mode ──────────────────────────────────────────────────────────────
@@ -195,6 +202,37 @@ func runBlock(ctx context.Context, p *pool.Pool, genesis *fixture.GenesisChainCo
 	}
 	wg.Wait()
 	return exitCode
+}
+
+// dumpBlock fetches a single block and writes its SSZ input, in the zesu-zkvm
+// file framing, to dir/<block>.bin without running any guest. Returns an exit
+// code.
+func dumpBlock(ctx context.Context, p *pool.Pool, genesis *fixture.GenesisChainConfig, blockNum uint64, verbose bool, engineURL, jwtSecretFile, dir string) int {
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
+	input, elNode, meta, err := pipeline.Fetch(fetchCtx, p, blockNum, genesis, verbose, engineURL, jwtSecretFile)
+	fetchCancel()
+	if err != nil {
+		log.Printf("block #%d: fetch error: %v", blockNum, err)
+		return 1
+	}
+	// A guest would reject the input anyway, but a dump is kept as a vector, so
+	// an input built without the BAL the header commits to is not written.
+	if meta.BALErr != nil {
+		log.Printf("block #%d: not dumping: %v", blockNum, meta.BALErr)
+		return 1
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("DUMP_DIR: %v", err)
+		return 1
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d.bin", blockNum))
+	if err := os.WriteFile(path, fixture.ZkvmFrame(input), 0o644); err != nil {
+		log.Printf("block #%d: dump: %v", blockNum, err)
+		return 1
+	}
+	log.Printf("block #%d: wrote %s (%d SSZ bytes from %s | txs=%d gas=%d)",
+		blockNum, path, len(input), elNode, meta.TxCount, meta.GasUsed)
+	return 0
 }
 
 func splitEnv(key string) []string {

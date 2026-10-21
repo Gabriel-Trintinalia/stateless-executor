@@ -56,6 +56,10 @@ type BlockMeta struct {
 	ExcessBlobGas uint64
 	SlotNumber    uint64
 	BALBytes      int
+	// BALErr is set when the header commits to a BAL (BlockAccessListHash) but
+	// none was fetched, or the fetched one does not hash to it. Fetch still
+	// returns an input; callers that must not use it (dumps) check this.
+	BALErr error
 }
 
 // witness mirrors the JSON returned by debug_executionWitness.
@@ -170,7 +174,9 @@ func Fetch(ctx context.Context, p *pool.Pool, blockNum uint64, genesis *fixture.
 		}
 	}
 	if len(balBytes) > 0 {
-		verifyBALHash(blockNum, balBytes, block)
+		meta.BALErr = verifyBALHash(blockNum, balBytes, block)
+	} else if block.Header().BlockAccessListHash != nil {
+		meta.BALErr = fmt.Errorf("header commits to a BAL but none was fetched")
 	}
 	meta.BALBytes = len(balBytes)
 
@@ -399,24 +405,26 @@ func fetchBAL(ctx context.Context, p *pool.Pool, rawURL, hexNum string) ([]byte,
 	return buf.Bytes(), nil
 }
 
-// verifyBALHash logs a warning if the encoded BAL bytes don't hash to the
-// expected hash from the block header.
-func verifyBALHash(blockNum uint64, balBytes []byte, block *types.Block) {
+// verifyBALHash checks that the encoded BAL bytes hash to the header's
+// BlockAccessListHash, logging the outcome. It returns an error on a decode
+// failure or mismatch, and nil when the header carries no BAL hash.
+func verifyBALHash(blockNum uint64, balBytes []byte, block *types.Block) error {
 	expected := block.Header().BlockAccessListHash
 	if expected == nil {
-		return
+		return nil
 	}
 	var enc bal.BlockAccessList
 	if err := rlp.DecodeBytes(balBytes, &enc); err != nil {
 		log.Printf("block #%d: BAL hash check: decode error: %v", blockNum, err)
-		return
+		return fmt.Errorf("BAL decode: %w", err)
 	}
 	got := enc.Hash()
 	if got != *expected {
 		log.Printf("block #%d: BAL hash MISMATCH: got=%s want=%s", blockNum, got.Hex(), expected.Hex())
-	} else {
-		log.Printf("block #%d: BAL hash OK (%s)", blockNum, got.Hex()[:10])
+		return fmt.Errorf("BAL hash %s does not match header %s", got.Hex(), expected.Hex())
 	}
+	log.Printf("block #%d: BAL hash OK (%s)", blockNum, got.Hex()[:10])
+	return nil
 }
 
 type balAccountChangeJSON struct {

@@ -1,8 +1,6 @@
 package fixture
 
 import (
-	"bytes"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,19 +34,7 @@ func ZesuInputFromZkevmBlock(tc *ZkevmTestCase, block *ZkevmBlock) ([]byte, bool
 	if err != nil {
 		return nil, false, fmt.Errorf("decode statelessInputBytes: %w", err)
 	}
-	contentLen := len(ssz)
-	// Ziskemu requires payload length to be a multiple of 8 bytes; pad
-	// with zeros AFTER the content. The length header carries the true
-	// (unpadded) content length so the guest sees only the SSZ bytes.
-	for len(ssz)%8 != 0 {
-		ssz = append(ssz, 0)
-	}
-	var out bytes.Buffer
-	var lenBuf [8]byte
-	binary.LittleEndian.PutUint64(lenBuf[:], uint64(contentLen))
-	out.Write(lenBuf[:])
-	out.Write(ssz)
-	return out.Bytes(), expectedSuccess, nil
+	return ZkvmFrame(ssz), expectedSuccess, nil
 }
 
 // fixtureHeader rebuilds the block header a fixture describes, so its hash is
