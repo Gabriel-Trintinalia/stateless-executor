@@ -68,6 +68,11 @@ GUEST_BINARIES=zesu:/path/to/zesu \
 GENESIS_FILE=/tmp/genesis-data/genesis.json \
 BLOCK_NUMBER=42 \
 go run .
+
+# Dump a single block's zkVM input to ./vectors/42.bin, without running a guest
+EL_RPC_URLS=http://127.0.0.1:<rpc-port> \
+BLOCK_NUMBER=42 DUMP_DIR=./vectors \
+go run .
 ```
 
 ### Environment variables
@@ -80,6 +85,7 @@ go run .
 | `ENGINE_RPC_URL` | | Engine API endpoint (required for BAL on Amsterdam+) |
 | `JWT_SECRET_FILE` | | Path to JWT secret for engine API auth |
 | `BLOCK_NUMBER` | | If set, verify this single block and exit |
+| `DUMP_DIR` | | With `BLOCK_NUMBER`: write the block's zkVM input (length-framed SSZ) to `DUMP_DIR/<block>.bin` and exit without running guests; `GUEST_BINARIES` may be empty |
 | `VERBOSE` | | Set to `true` to log raw witness headers and `statelessInputBytes` |
 | `LISTEN_ADDR` | | HTTP listen address (default `:8080`) |
 
