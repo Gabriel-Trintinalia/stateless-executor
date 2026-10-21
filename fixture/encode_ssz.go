@@ -118,21 +118,19 @@ func ZesuInputSSZ(f *FixtureFile) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ZkvmFrame(payload), nil
+}
 
-	// Ziskemu requires file payload to be a multiple of 8 bytes (memory alignment).
-	// Write the exact SSZ content length in the framing header so that
-	// read_input_slice() returns only the SSZ bytes — trailing padding zeros would
-	// otherwise be read as part of the witness and trigger InvalidSsz.
-	sszLen := len(payload)
-	for len(payload)%8 != 0 {
-		payload = append(payload, 0)
-	}
-	var out bytes.Buffer
-	var lenBuf [8]byte
-	binary.LittleEndian.PutUint64(lenBuf[:], uint64(sszLen))
-	out.Write(lenBuf[:])
-	out.Write(payload)
-	return out.Bytes(), nil
+// ZkvmFrame wraps raw SSZ input in the zesu-zkvm file framing: the SSZ length
+// as a u64 LE header, then the SSZ zero-padded to a multiple of 8 bytes
+// (ziskemu requires an 8-byte-aligned input). The header carries the unpadded
+// length so the guest reads only the SSZ bytes — trailing padding would
+// otherwise be read as part of the witness and trigger InvalidSsz.
+func ZkvmFrame(ssz []byte) []byte {
+	out := make([]byte, 8+(len(ssz)+7)&^7)
+	binary.LittleEndian.PutUint64(out, uint64(len(ssz)))
+	copy(out[8:], ssz)
+	return out
 }
 
 // encodeSszStatelessInput serialises SszStatelessInput (v0.8.0).
